@@ -1046,6 +1046,34 @@ class Digamma : public UnaryPrimitive {
   DEFINE_INPUT_OUTPUT_SHAPE()
 };
 
+class BesselI0e : public UnaryPrimitive {
+ public:
+  explicit BesselI0e(Stream stream) : UnaryPrimitive(stream) {}
+
+  void eval_cpu(const std::vector<array>& inputs, array& out) override;
+  void eval_gpu(const std::vector<array>& inputs, array& out) override;
+
+  DEFINE_VMAP()
+  DEFINE_GRADS()
+  DEFINE_NAME(BesselI0e)
+  DEFINE_DEFAULT_IS_EQUIVALENT()
+  DEFINE_INPUT_OUTPUT_SHAPE()
+};
+
+class BesselI1e : public UnaryPrimitive {
+ public:
+  explicit BesselI1e(Stream stream) : UnaryPrimitive(stream) {}
+
+  void eval_cpu(const std::vector<array>& inputs, array& out) override;
+  void eval_gpu(const std::vector<array>& inputs, array& out) override;
+
+  DEFINE_VMAP()
+  DEFINE_GRADS()
+  DEFINE_NAME(BesselI1e)
+  DEFINE_DEFAULT_IS_EQUIVALENT()
+  DEFINE_INPUT_OUTPUT_SHAPE()
+};
+
 class MLX_API Exp : public UnaryPrimitive {
  public:
   explicit Exp(Stream stream) : UnaryPrimitive(stream) {}
