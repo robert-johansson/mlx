@@ -264,5 +264,11 @@ size_t get_cache_memory() {
 void clear_cache() {
   return metal::allocator().clear_cache();
 }
+size_t get_num_resources() {
+  return metal::allocator().get_num_resources();
+}
+size_t get_resource_limit() {
+  return metal::allocator().get_resource_limit();
+}
 
 } // namespace mlx::core

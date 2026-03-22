@@ -36,6 +36,12 @@ class MetalAllocator : public allocator::Allocator {
   size_t get_cache_memory() {
     return buffer_cache_.cache_size();
   };
+  size_t get_num_resources() {
+    return num_resources_;
+  };
+  size_t get_resource_limit() {
+    return resource_limit_;
+  };
   size_t set_cache_limit(size_t limit);
   size_t set_memory_limit(size_t limit);
   size_t get_memory_limit();
