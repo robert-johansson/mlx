@@ -1,6 +1,7 @@
 // Copyright © 2023-2024 Apple Inc.
 
 #include <cstdlib>
+#include <mutex>
 #include <sstream>
 
 #include <fmt/format.h>
@@ -13,6 +14,7 @@
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/metal.h"
 #include "mlx/backend/metal/utils.h"
+#include "mlx/compile_impl.h"
 #include "mlx/utils.h"
 
 namespace std {
@@ -798,11 +800,32 @@ MTL::ComputePipelineState* Device::get_kernel(
       linked_functions);
 }
 
+void Device::set_residency_set(const MTL::ResidencySet* residency_set) {
+  if (residency_set_ != nullptr) {
+    throw std::runtime_error(
+        "[Device::set_residency_set] Can only be set once.");
+  }
+  if (residency_set == nullptr) {
+    return;
+  }
+  residency_set_ = residency_set;
+  // Attach residency set to existing command queues
+  for (auto& [_, encoder] : encoders_) {
+    encoder.get_command_queue()->addResidencySet(residency_set_);
+  }
+}
+
+namespace {
+std::once_flag library_cleaner_flag;
+Device* metal_device_ptr = nullptr;
+} // namespace
+
 Device& device(mlx::core::Device) {
   // Leak singleton device intentionally, to avoid cases where a compute kernel
   // returns and tries to access the object after it has been freed by the main
   // thread teardown.
   static Device* metal_device = new Device;
+  metal_device_ptr = metal_device;
   return *metal_device;
 }
 
@@ -819,6 +842,16 @@ CommandEncoder& get_command_encoder(Stream s) {
 std::unordered_map<int, CommandEncoder>& get_command_encoders() {
   static thread_local std::unordered_map<int, CommandEncoder> encoders;
   return encoders;
+}
+
+void register_library_cleaner() {
+  std::call_once(library_cleaner_flag, [] {
+    detail::compile_set_library_cleaner([](const std::string& name) {
+      if (metal_device_ptr) {
+        metal_device_ptr->clear_library(name);
+      }
+    });
+  });
 }
 
 NS::SharedPtr<NS::AutoreleasePool> new_scoped_memory_pool() {

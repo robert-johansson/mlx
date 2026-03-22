@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include <functional>
+#include <string>
 #include <unordered_map>
 
 #include "mlx/api.h"
@@ -36,6 +38,12 @@ MLX_API void compile_clear_cache();
 
 // Return true if the cache is empty.
 MLX_API bool compile_cache_empty();
+
+// Register a callback to release backend resources (e.g. Metal libraries)
+// when a compiled function's kernel library is no longer needed.
+// Called by backend initialization code.
+using LibraryCleaner = std::function<void(const std::string&)>;
+MLX_API void compile_set_library_cleaner(LibraryCleaner fn);
 
 bool compile_available_for_device(const Device& device);
 
