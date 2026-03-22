@@ -231,6 +231,10 @@ MLX_API Device& device(mlx::core::Device);
 MLX_API CommandEncoder& get_command_encoder(Stream s);
 
 std::unordered_map<int, CommandEncoder>& get_command_encoders();
+
+// Register the Metal library cleaner with the compile cache.
+// Called lazily on first compiled function execution.
+void register_library_cleaner();
 NS::SharedPtr<NS::AutoreleasePool> new_scoped_memory_pool();
 
 bool is_nax_available();
