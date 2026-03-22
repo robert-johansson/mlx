@@ -63,6 +63,15 @@ MLX_API size_t set_cache_limit(size_t limit);
 /* Clear the memory cache. */
 MLX_API void clear_cache();
 
+/* Get the number of live Metal buffer allocations.
+ * Each allocation counts towards the macOS resource limit (~499K).
+ * Includes both active and cached buffers. */
+MLX_API size_t get_num_resources();
+
+/* Get the Metal buffer resource limit.
+ * When num_resources reaches this limit, allocations fail. */
+MLX_API size_t get_resource_limit();
+
 /* Set the wired size limit.
  *
  * Note, this function is only useful when using the Metal backend with
