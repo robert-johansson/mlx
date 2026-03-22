@@ -257,6 +257,7 @@ inline void build_kernel(
 void Compiled::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
+  metal::register_library_cleaner();
   // Get the kernel if someone else built it already
   auto& s = stream();
   auto& d = metal::device(s.device);

@@ -233,6 +233,10 @@ class MLX_API Device {
 
 MLX_API Device& device(mlx::core::Device);
 
+// Register the Metal library cleaner with the compile cache.
+// Called lazily on first compiled function execution.
+void register_library_cleaner();
+
 NS::SharedPtr<NS::AutoreleasePool> new_scoped_memory_pool();
 
 bool is_nax_available();
