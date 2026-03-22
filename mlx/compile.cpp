@@ -367,14 +367,44 @@ class CompilerCache {
   }
 
   void erase(std::uintptr_t fun_id) {
+    clean_libraries(fun_id);
     cache_.erase(fun_id);
   }
 
   void clear() {
+    for (auto& [fun_id, entries] : cache_) {
+      clean_libraries_from_entries(entries);
+    }
     cache_.clear();
   }
 
  private:
+  void clean_libraries_from_entries(std::vector<CacheEntry>& entries) {
+    if (!library_cleaner_) {
+      return;
+    }
+    for (auto& entry : entries) {
+      for (auto& arr : entry.tape) {
+        if (arr.has_primitive()) {
+          if (auto* compiled =
+                  dynamic_cast<Compiled*>(arr.primitive_ptr().get())) {
+            auto name = compiled->lib_name();
+            if (!name.empty()) {
+              library_cleaner_(name);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  void clean_libraries(std::uintptr_t fun_id) {
+    auto it = cache_.find(fun_id);
+    if (it != cache_.end()) {
+      clean_libraries_from_entries(it->second);
+    }
+  }
+
   CompilerCache() {
     // Make sure the allocator is fully
     // initialized before the compiler cache
@@ -382,7 +412,9 @@ class CompilerCache {
   }
 
   friend CompilerCache& compiler_cache();
+  friend void compile_set_library_cleaner(LibraryCleaner fn);
   std::unordered_map<std::uintptr_t, std::vector<CacheEntry>> cache_;
+  LibraryCleaner library_cleaner_;
 };
 
 CompilerCache& compiler_cache() {
@@ -1190,6 +1222,10 @@ void compile_erase(std::uintptr_t fun_id) {
 
 void compile_clear_cache() {
   detail::compiler_cache().clear();
+}
+
+void compile_set_library_cleaner(LibraryCleaner fn) {
+  detail::compiler_cache().library_cleaner_ = std::move(fn);
 }
 
 } // namespace detail

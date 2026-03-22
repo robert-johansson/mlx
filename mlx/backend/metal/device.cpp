@@ -1,6 +1,7 @@
 // Copyright © 2023-2024 Apple Inc.
 
 #include <cstdlib>
+#include <mutex>
 #include <sstream>
 
 #define NS_PRIVATE_IMPLEMENTATION
@@ -11,6 +12,7 @@
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/metal.h"
 #include "mlx/backend/metal/utils.h"
+#include "mlx/compile_impl.h"
 #include "mlx/utils.h"
 
 namespace std {
@@ -829,12 +831,28 @@ void Device::set_residency_set(const MTL::ResidencySet* residency_set) {
   }
 }
 
+namespace {
+std::once_flag library_cleaner_flag;
+Device* metal_device_ptr = nullptr;
+} // namespace
+
 Device& device(mlx::core::Device) {
   // Leak singleton device intentionally, to avoid cases where a compute kernel
   // returns and tries to access the object after it has been freed by the main
   // thread teardown.
   static Device* metal_device = new Device;
+  metal_device_ptr = metal_device;
   return *metal_device;
+}
+
+void register_library_cleaner() {
+  std::call_once(library_cleaner_flag, [] {
+    detail::compile_set_library_cleaner([](const std::string& name) {
+      if (metal_device_ptr) {
+        metal_device_ptr->clear_library(name);
+      }
+    });
+  });
 }
 
 std::unique_ptr<void, std::function<void(void*)>> new_scoped_memory_pool() {

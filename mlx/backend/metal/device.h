@@ -236,6 +236,10 @@ class MLX_API Device {
 
 MLX_API Device& device(mlx::core::Device);
 
+// Register the Metal library cleaner with the compile cache.
+// Called lazily on first compiled function execution.
+void register_library_cleaner();
+
 std::unique_ptr<void, std::function<void(void*)>> new_scoped_memory_pool();
 
 inline bool is_nax_available() {
