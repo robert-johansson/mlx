@@ -681,6 +681,11 @@ bool ArgSort::is_equivalent(const Primitive& other) const {
   return axis_ == r_other.axis_;
 }
 
+bool SearchSorted::is_equivalent(const Primitive& other) const {
+  const SearchSorted& r_other = static_cast<const SearchSorted&>(other);
+  return right_ == r_other.right_;
+}
+
 std::vector<array> ArgSort::vjp(
     const std::vector<array>& primals,
     const std::vector<array>&,
