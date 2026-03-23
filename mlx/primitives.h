@@ -399,6 +399,23 @@ class ArgSort : public UnaryPrimitive {
   int axis_;
 };
 
+class SearchSorted : public Primitive {
+ public:
+  explicit SearchSorted(Stream stream, bool right)
+      : Primitive(stream), right_(right) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(SearchSorted)
+  bool is_equivalent(const Primitive& other) const override;
+
+ private:
+  bool right_;
+};
+
 class AsType : public UnaryPrimitive {
  public:
   explicit AsType(Stream stream, Dtype dtype)

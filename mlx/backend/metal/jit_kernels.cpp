@@ -361,6 +361,24 @@ MTL::ComputePipelineState* get_scan_kernel(
   return d.get_kernel(kernel_name, lib);
 }
 
+MTL::ComputePipelineState* get_searchsorted_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const array& sorted,
+    bool right) {
+  std::string lib_name = kernel_name;
+  auto lib = d.get_library(lib_name, [&]() {
+    auto type_str = get_type_string(sorted.dtype());
+    std::ostringstream kernel_source;
+    kernel_source << metal::utils() << metal::searchsorted();
+    std::string side = right ? "right" : "left";
+    kernel_source << get_template_definition(
+        kernel_name, "searchsorted_" + side, type_str);
+    return kernel_source.str();
+  });
+  return d.get_kernel(kernel_name, lib);
+}
+
 MTL::ComputePipelineState* get_sort_kernel(
     metal::Device& d,
     const std::string& kernel_name,
