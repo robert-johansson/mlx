@@ -783,6 +783,21 @@ MLX_API array argsort(const array& a, StreamOrDevice s = {});
 MLX_API array argsort(const array& a, int axis, StreamOrDevice s = {});
 
 /**
+ * Find insertion indices for values in a sorted array.
+ * Returns indices such that inserting values at these positions
+ * maintains the sorted order.
+ *
+ * a: 1D sorted array
+ * v: values to search for (any shape)
+ * right: if true, return rightmost valid index; default false (leftmost)
+ */
+MLX_API array searchsorted(
+    const array& a,
+    const array& v,
+    bool right = false,
+    StreamOrDevice s = {});
+
+/**
  * Returns a partitioned copy of the flattened array
  * such that the smaller kth elements are first.
  **/

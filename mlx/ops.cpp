@@ -2596,6 +2596,22 @@ array argsort(const array& a, int axis, StreamOrDevice s /* = {} */) {
       a.shape(), uint32, std::make_shared<ArgSort>(to_stream(s), axis), {a});
 }
 
+array searchsorted(
+    const array& a,
+    const array& v,
+    bool right /* = false */,
+    StreamOrDevice s /* = {} */) {
+  if (a.ndim() != 1) {
+    throw std::invalid_argument(
+        "[searchsorted] First argument must be a 1D sorted array.");
+  }
+  return array(
+      v.shape(),
+      int32,
+      std::make_shared<SearchSorted>(to_stream(s), right),
+      {astype(a, a.dtype(), s), astype(v, a.dtype(), s)});
+}
+
 /**
  * Returns a partitioned copy of the flattened array
  * such that the smaller kth elements are first.
