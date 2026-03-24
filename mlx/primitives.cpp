@@ -1793,19 +1793,9 @@ std::pair<std::vector<array>, std::vector<int>> Divide::vmap(
   // But floor_divide() creates a Divide primitive with integer dtype
   // for integer division. Preserve that: if inputs are integer, keep
   // integer semantics by constructing the primitive directly.
-  auto dtype = promote_types(a.dtype(), b.dtype());
-  if (issubdtype(dtype, integer)) {
-    auto bcast = broadcast_arrays(
-        {astype(a, dtype, stream()), astype(b, dtype, stream())}, stream());
-    return {
-        {array(
-            bcast[0].shape(),
-            dtype,
-            std::make_shared<Divide>(stream()),
-            std::move(bcast))},
-        {to_ax}};
-  }
-  return {{divide(a, b, stream())}, {to_ax}};
+  auto out = issubdtype(a.dtype(), integer) ? floor_divide(a, b, stream())
+                                            : divide(a, b, stream());
+  return {{out}, {to_ax}};
 }
 
 std::vector<array> Remainder::vjp(
