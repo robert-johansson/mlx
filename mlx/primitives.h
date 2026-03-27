@@ -2530,6 +2530,7 @@ class Inverse : public UnaryPrimitive {
   void eval_gpu(const std::vector<array>& inputs, array& output) override;
 
   DEFINE_VMAP()
+  DEFINE_GRADS()
   DEFINE_NAME(Inverse)
   auto state() const {
     return std::make_pair(tri_, upper_);

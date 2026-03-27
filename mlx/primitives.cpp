@@ -6233,6 +6233,35 @@ std::pair<std::vector<array>, std::vector<int>> Inverse::vmap(
   return {{linalg::inv(a, stream())}, {ax}};
 }
 
+std::vector<array> Inverse::jvp(
+    const std::vector<array>& primals,
+    const std::vector<array>& tangents,
+    const std::vector<int>& argnums) {
+  // JVP of matrix inverse: dY = -Y @ dA @ Y
+  auto& s = stream();
+  auto Y = linalg::inv(primals[0], s);
+  auto& dA = tangents[0];
+  return {negative(matmul(matmul(Y, dA, s), Y, s), s)};
+}
+
+std::vector<array> Inverse::vjp(
+    const std::vector<array>& primals,
+    const std::vector<array>& cotangents,
+    const std::vector<int>& argnums,
+    const std::vector<array>& outputs) {
+  // VJP of matrix inverse: g_A = -Y^T @ g_Y @ Y^T
+  auto& s = stream();
+  auto& Y = outputs[0];
+  auto& g = cotangents[0];
+
+  std::vector<int> reorder(Y.ndim());
+  std::iota(reorder.begin(), reorder.end(), 0);
+  std::iter_swap(reorder.end() - 1, reorder.end() - 2);
+
+  auto Yt = transpose(Y, reorder, s);
+  return {negative(matmul(matmul(Yt, g, s), Yt, s), s)};
+}
+
 std::pair<std::vector<array>, std::vector<int>> View::vmap(
     const std::vector<array>& inputs,
     const std::vector<int>& axes) {
