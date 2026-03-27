@@ -2551,6 +2551,7 @@ class Cholesky : public UnaryPrimitive {
   }
 
   DEFINE_VMAP()
+  DEFINE_GRADS()
   DEFINE_NAME(Cholesky)
 
  private:
