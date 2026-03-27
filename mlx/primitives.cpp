@@ -1006,6 +1006,97 @@ std::pair<std::vector<array>, std::vector<int>> Cholesky::vmap(
   return {{linalg::cholesky(a, upper_, stream())}, {ax}};
 }
 
+std::vector<array> Cholesky::jvp(
+    const std::vector<array>& primals,
+    const std::vector<array>& tangents,
+    const std::vector<int>& argnums) {
+  // Forward-mode Cholesky derivative (Murray 2016):
+  // Given L = chol(A) and tangent dA:
+  //   S = L^{-1} @ dA @ L^{-T}
+  //   dL = L @ Phi(S)
+  // where Phi(X) = tril(X) with diagonal halved
+  auto& s = stream();
+  auto& L = primals[0]; // actually need the output L, not the input A
+  // We need the output; recompute it
+  auto L_out = linalg::cholesky(primals[0], upper_, s);
+  auto& dA = tangents[0];
+
+  std::vector<int> reorder(L_out.ndim());
+  std::iota(reorder.begin(), reorder.end(), 0);
+  std::iter_swap(reorder.end() - 1, reorder.end() - 2);
+
+  auto L_lower = upper_ ? transpose(L_out, reorder, s) : L_out;
+  auto dA_sym = upper_ ? transpose(dA, reorder, s) : dA;
+
+  // S = L^{-1} @ dA @ L^{-T}
+  auto Y = linalg::solve_triangular(L_lower, dA_sym, /*upper=*/false, s);
+  auto Lt = transpose(L_lower, reorder, s);
+  auto S = linalg::solve_triangular(Lt, transpose(Y, reorder, s), /*upper=*/true, s);
+  S = transpose(S, reorder, s);
+
+  // Phi(S) = tril(S, -1) + 0.5 * diag(diag(S))
+  auto S_strict = tril(S, -1, s);
+  auto S_diag_half = multiply(array(0.5f, S.dtype()), diag(diagonal(S, 0, -2, -1, s), 0, s), s);
+  auto phi_S = add(S_strict, S_diag_half, s);
+
+  // dL = L @ Phi(S)
+  auto dL = matmul(L_lower, phi_S, s);
+
+  if (upper_) {
+    dL = transpose(dL, reorder, s);
+  }
+  return {dL};
+}
+
+std::vector<array> Cholesky::vjp(
+    const std::vector<array>& primals,
+    const std::vector<array>& cotangents,
+    const std::vector<int>& argnums,
+    const std::vector<array>& outputs) {
+  // Cholesky VJP (Murray 2016, Seeger et al. 2017)
+  // Given L = cholesky(A) and cotangent g_L:
+  //   S = L^T @ g_L
+  //   Phi(S) = tril(S) with diagonal halved
+  //   g_A = L^{-T} @ Phi(S) @ L^{-1}, symmetrized
+  assert(argnums.size() == 1 && argnums[0] == 0);
+  auto& s = stream();
+  auto& L = outputs[0];
+  auto& g = cotangents[0];
+
+  // For upper=true: U = cholesky_upper(A), L = U^T
+  // Transform to lower-triangular form, compute, transform back
+  std::vector<int> reorder(L.ndim());
+  std::iota(reorder.begin(), reorder.end(), 0);
+  std::iter_swap(reorder.end() - 1, reorder.end() - 2);
+
+  auto L_lower = upper_ ? transpose(L, reorder, s) : L;
+  auto g_lower = upper_ ? transpose(g, reorder, s) : g;
+
+  // S = L^T @ g_L
+  auto S = matmul(transpose(L_lower, reorder, s), g_lower, s);
+
+  // Phi(S) = tril(S) with diagonal halved
+  // = tril(S, -1) + 0.5 * diag(diagonal(S))
+  auto S_strict = tril(S, -1, s);
+  auto S_diag_half = multiply(array(0.5f, S.dtype()), diag(diagonal(S, 0, -2, -1, s), 0, s), s);
+  auto phi_S = add(S_strict, S_diag_half, s);
+
+  // Two triangular solves: g_A = L^{-T} @ Phi(S) @ L^{-1}
+  // Step 1: Y = L^{-T} @ Phi(S)  via  solve_triangular(L^T, Phi(S), upper=true)
+  auto Lt = transpose(L_lower, reorder, s);
+  auto Y = linalg::solve_triangular(Lt, phi_S, /*upper=*/true, s);
+
+  // Step 2: W = L^{-T} @ Y^T  via  solve_triangular(L^T, Y^T, upper=true)
+  auto Yt = transpose(Y, reorder, s);
+  auto W = linalg::solve_triangular(Lt, Yt, /*upper=*/true, s);
+
+  // g_A = symmetrize(W^T) = 0.5 * (W^T + W)
+  auto Wt = transpose(W, reorder, s);
+  auto g_A = multiply(array(0.5f, W.dtype()), add(Wt, W, s), s);
+
+  return {g_A};
+}
+
 std::pair<std::vector<array>, std::vector<int>> Eig::vmap(
     const std::vector<array>& inputs,
     const std::vector<int>& axes) {
