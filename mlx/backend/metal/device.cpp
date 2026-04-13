@@ -800,21 +800,6 @@ MTL::ComputePipelineState* Device::get_kernel(
       linked_functions);
 }
 
-void Device::set_residency_set(const MTL::ResidencySet* residency_set) {
-  if (residency_set_ != nullptr) {
-    throw std::runtime_error(
-        "[Device::set_residency_set] Can only be set once.");
-  }
-  if (residency_set == nullptr) {
-    return;
-  }
-  residency_set_ = residency_set;
-  // Attach residency set to existing command queues
-  for (auto& [_, encoder] : encoders_) {
-    encoder.get_command_queue()->addResidencySet(residency_set_);
-  }
-}
-
 namespace {
 std::once_flag library_cleaner_flag;
 Device* metal_device_ptr = nullptr;
