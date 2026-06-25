@@ -52,6 +52,13 @@ Device::Device(int device) : device_(device) {
       &managed_memory_, cudaDevAttrManagedMemory, device_));
   CHECK_CUDA_ERROR(cudaDeviceGetAttribute(
       &memory_pools_, cudaDevAttrMemoryPoolsSupported, device_));
+  // On Jetson (Thor/iGPU) the cudaMallocAsync memory pool is capped well below
+  // total unified memory (~43GB observed), so large models OOM despite ample
+  // RAM. Setting MLX_CUDA_DISABLE_MEMPOOL forces the synchronous cudaMalloc /
+  // managed path (allocator.cpp), which can use the full unified pool.
+  if (std::getenv("MLX_CUDA_DISABLE_MEMPOOL")) {
+    memory_pools_ = 0;
+  }
 }
 
 Device::~Device() = default;
