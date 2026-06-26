@@ -6,7 +6,11 @@
 
 #include "cuda_jit_sources.h"
 
+#include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <shared_mutex>
@@ -100,8 +104,18 @@ const std::filesystem::path& ptx_cache_dir() {
     if (auto c = std::getenv("MLX_PTX_CACHE_DIR"); c) {
       cache = c;
     } else {
-      cache =
-          std::filesystem::temp_directory_path() / "mlx" / version() / "ptx";
+      // Persist the JIT cache across runs and reboots so the expensive NVRTC
+      // compile is paid only once. Prefer $XDG_CACHE_HOME, then $HOME/.cache,
+      // and only fall back to the (often volatile) temp dir.
+      std::filesystem::path root;
+      if (auto x = std::getenv("XDG_CACHE_HOME"); x && *x) {
+        root = std::filesystem::path(x) / "mlx";
+      } else if (auto h = std::getenv("HOME"); h && *h) {
+        root = std::filesystem::path(h) / ".cache" / "mlx";
+      } else {
+        root = std::filesystem::temp_directory_path() / "mlx";
+      }
+      cache = root / version() / "ptx";
     }
 
 #if defined(_WIN32)
@@ -198,18 +212,54 @@ void write_cached_ptx(
     std::filesystem::create_directories(parent);
   }
 
-  // Write the compiled code and mangled names
-  std::ofstream ptx_file(ptx_path, std::ios::binary);
-  if (!ptx.empty()) {
-    ptx_file.write(&ptx.front(), ptx.size());
-  }
-  std::ofstream txt_file(ptx_path.replace_extension(".txt"), std::ios::binary);
-  for (const auto& [name, mangled] : ptx_kernels) {
-    txt_file << name << "\t" << mangled << std::endl;
-  }
+  // Write atomically (unique temp file + rename) so a concurrent reader -
+  // possibly another process sharing this persistent cache - never observes a
+  // partially written .ptx/.txt. The file name already encodes a hash of the
+  // exact source/arch/nvrtc, so any two writers of the same name emit
+  // byte-identical content.
+  static std::atomic<uint64_t> tmp_seq{0};
+  static const uint64_t proc_nonce =
+      static_cast<uint64_t>(
+          std::chrono::steady_clock::now().time_since_epoch().count()) ^
+      (reinterpret_cast<uintptr_t>(&tmp_seq) * 0x9e3779b97f4a7c15ull);
+  auto write_atomic = [](const std::filesystem::path& path,
+                         const char* data,
+                         size_t size) {
+    auto tmp = path;
+    tmp += fmt::format(
+        ".tmp.{:x}.{}",
+        proc_nonce,
+        tmp_seq.fetch_add(1, std::memory_order_relaxed));
+    {
+      std::ofstream out(tmp, std::ios::binary);
+      if (size > 0) {
+        out.write(data, size);
+      }
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) {
+      std::filesystem::remove(tmp, ec);
+    }
+  };
 
-  // Write the generated code
-  std::ofstream source_file(ptx_path.replace_extension(".cu"));
+  // Mangled names (.txt) and compiled code (.ptx/.cubin). Publish the .txt
+  // BEFORE the .ptx: read_cached_ptx gates on the .ptx existing (file_size on
+  // ptx_path), so writing the .ptx last guarantees that any reader which sees
+  // the .ptx also sees a complete .txt - closing the cross-process window where
+  // a renamed .ptx is observed with a still-missing .txt (which would yield a
+  // module with zero kernels).
+  auto txt_path = std::filesystem::path(ptx_path).replace_extension(".txt");
+  std::string txt;
+  for (const auto& [name, mangled] : ptx_kernels) {
+    txt += fmt::format("{}\t{}\n", name, mangled);
+  }
+  write_atomic(txt_path, txt.data(), txt.size());
+  write_atomic(ptx_path, ptx.data(), ptx.size());
+
+  // Generated source, for debugging only (best-effort, non-atomic).
+  std::ofstream source_file(
+      std::filesystem::path(ptx_path).replace_extension(".cu"));
   source_file << source_code;
 }
 
@@ -286,6 +336,59 @@ constexpr const char* g_headers[] = {
     jit_source_ternary_ops,
     jit_source_utils,
 };
+
+// FNV-1a over a raw byte range, matching the hashing style of BytesHash in
+// lru_cache.h (widened to 64 bits here for the cache file-name key).
+inline uint64_t fnv1a(const void* data, size_t size, uint64_t hash) {
+  const auto* bytes = static_cast<const uint8_t*>(data);
+  for (size_t i = 0; i < size; ++i) {
+    hash ^= bytes[i];
+    hash *= 0x100000001b3ull;
+  }
+  return hash;
+}
+
+// Hash of all bundled device headers. Constant for a given binary, so compute
+// it once; a change to any header then invalidates every cached cubin.
+uint64_t headers_hash() {
+  static const uint64_t hash = []() {
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (const char* header : g_headers) {
+      h = fnv1a(header, std::strlen(header), h);
+    }
+    return h;
+  }();
+  return hash;
+}
+
+// Build the disk-cache key for a module. On top of the module name it folds in
+// the GPU architecture and the NVRTC version (so a cubin is never reused on a
+// different GPU, driver or toolkit) and a hash of the generated source plus the
+// bundled headers (so a source/header revision invalidates the cache even when
+// the module name is unchanged).
+std::string cached_module_name(
+    Device& device,
+    const std::string& module_name,
+    const std::string& source_code) {
+  int cc_major = device.compute_capability_major();
+  int cc_minor = device.compute_capability_minor();
+  const char* arch_tag = (cc_major >= 9) ? "a" : "";
+
+  int nvrtc_major = 0, nvrtc_minor = 0;
+  CHECK_NVRTC_ERROR(nvrtcVersion(&nvrtc_major, &nvrtc_minor));
+
+  uint64_t hash = fnv1a(source_code.data(), source_code.size(), headers_hash());
+
+  return fmt::format(
+      "{}.sm_{}{}{}.nvrtc{}_{}.{:016x}",
+      module_name,
+      cc_major,
+      cc_minor,
+      arch_tag,
+      nvrtc_major,
+      nvrtc_minor,
+      hash);
+}
 
 void compile(
     Device& device,
@@ -402,10 +505,17 @@ JitModule::JitModule(
   std::string ptx;
   std::vector<std::pair<std::string, std::string>> ptx_kernels;
 
-  // Try to load them from the file cache
-  if (!read_cached_ptx(ptx_cache_dir(), module_name, ptx, ptx_kernels)) {
-    auto [precompiled, source_code, kernel_names] = builder();
+  // Generate the source up-front so the disk-cache key can be bound to its
+  // exact contents (generating the source is cheap; compiling it is not).
+  auto [precompiled, source_code, kernel_names] = builder();
 
+  // Key the cache on the GPU arch and NVRTC version in addition to the module
+  // name and a hash of the source + bundled headers, so a cached cubin is never
+  // reused across a different GPU, driver/toolkit or source revision.
+  std::string cache_name = cached_module_name(device, module_name, source_code);
+
+  // Try to load them from the file cache
+  if (!read_cached_ptx(ptx_cache_dir(), cache_name, ptx, ptx_kernels)) {
     // Get the PTX or cubin
     if (precompiled) {
       ptx = std::move(source_code);
@@ -419,7 +529,7 @@ JitModule::JitModule(
     // If requested save them in the file cache for the next launch
     if (use_disk_cache) {
       write_cached_ptx(
-          ptx_cache_dir(), module_name, ptx, ptx_kernels, source_code);
+          ptx_cache_dir(), cache_name, ptx, ptx_kernels, source_code);
     }
   }
 
