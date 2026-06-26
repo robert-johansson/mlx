@@ -1016,6 +1016,42 @@ std::pair<std::vector<array>, std::vector<int>> Cholesky::vmap(
   return {{linalg::cholesky(a, upper_, stream())}, {ax}};
 }
 
+std::vector<array> Cholesky::vjp(
+    const std::vector<array>& primals,
+    const std::vector<array>& cotangents,
+    const std::vector<int>& argnums,
+    const std::vector<array>& outputs) {
+  // Reverse-mode derivative of the Cholesky factorization (A = L Lᵀ for the
+  // lower factor, Uᵀ U for the upper). Standard result (Murray 2016; matches
+  // PyTorch cholesky_backward):
+  //   Phi(X) = tril(X) with the diagonal halved
+  //   phi    = Phi(Lᵀ @ L̄)
+  //   Ā      = L⁻ᵀ @ phi @ L⁻¹
+  //   Ā      = (Ā + Āᵀ) / 2            (A is symmetric)
+  // For the upper factor we transpose the output/cotangent into the lower form;
+  // Ā is symmetric so the gradient w.r.t. A is the same either way.
+  auto s = stream();
+  auto dt = primals[0].dtype();
+  auto L = upper_ ? swapaxes(outputs[0], -2, -1, s) : outputs[0];
+  auto Lbar = upper_ ? swapaxes(cotangents[0], -2, -1, s) : cotangents[0];
+  int n = L.shape(-1);
+
+  // phi = Phi(Lᵀ @ L̄): keep the lower triangle, halve the diagonal.
+  auto phi = matmul(swapaxes(L, -2, -1, s), Lbar, s);
+  phi = tril(phi, 0, s);
+  auto diag = multiply(phi, identity(n, dt, s), s);
+  phi = subtract(phi, multiply(array(0.5, dt), diag, s), s);
+
+  // Ā = L⁻ᵀ @ phi @ L⁻¹
+  auto Linv = linalg::tri_inv(L, /* upper = */ false, s);
+  auto LinvT = swapaxes(Linv, -2, -1, s);
+  auto Abar = matmul(matmul(LinvT, phi, s), Linv, s);
+
+  // Symmetrize: A is symmetric, so split the cotangent evenly across A and Aᵀ.
+  Abar = multiply(array(0.5, dt), add(Abar, swapaxes(Abar, -2, -1, s), s), s);
+  return {Abar};
+}
+
 std::pair<std::vector<array>, std::vector<int>> Eig::vmap(
     const std::vector<array>& inputs,
     const std::vector<int>& axes) {
