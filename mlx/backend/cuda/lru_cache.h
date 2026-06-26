@@ -5,6 +5,7 @@
 #include "mlx/utils.h"
 
 #include <cstring>
+#include <iostream>
 #include <list>
 #include <unordered_map>
 #include <utility>
@@ -88,13 +89,27 @@ class LRUCache {
       return {it->second, false};
     }
 
+    // Auto-grow instead of aborting: a burst of misses (more than twice the
+    // current capacity since the last grow) means the working set of keys no
+    // longer fits. Doubling the capacity and resetting the miss counter lets
+    // long-running workloads with many distinct keys (e.g. many distinct CUDA
+    // graphs) keep running without manual tuning. The |env_name| override still
+    // lets callers pre-size the cache, and MLX_ENABLE_CACHE_THRASHING_CHECK=0
+    // disables auto-grow entirely (env_name_ stays null -> fixed-size LRU).
     if (env_name_ && ++cache_misses_ > 2 * capacity_) {
-      throw std::runtime_error(
-          fmt::format(
-              "Cache thrashing is happening, please set the environment variable "
-              "{} to a larger value than {} to fix degraded performance.",
-              env_name_,
-              capacity_));
+      size_t new_capacity = 2 * capacity_;
+      if (!grow_warned_) {
+        grow_warned_ = true;
+        std::cerr << fmt::format(
+            "[mlx] Cache for {} is thrashing; growing capacity {} -> {}. "
+            "Set {} to pre-size the cache and avoid repeated growth.\n",
+            env_name_,
+            capacity_,
+            new_capacity,
+            env_name_);
+      }
+      resize(new_capacity);
+      cache_misses_ = 0;
     }
 
     vlist_.emplace_front(key, std::forward<U>(value));
@@ -129,6 +144,7 @@ class LRUCache {
 
   const char* env_name_{nullptr};
   size_t cache_misses_{0};
+  bool grow_warned_{false};
 
   list_type vlist_;
   map_type map_;
