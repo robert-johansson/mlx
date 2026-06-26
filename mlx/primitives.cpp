@@ -6148,6 +6148,24 @@ std::pair<std::vector<array>, std::vector<int>> Inverse::vmap(
   return {{linalg::inv(a, stream())}, {ax}};
 }
 
+std::vector<array> Inverse::vjp(
+    const std::vector<array>& primals,
+    const std::vector<array>& cotangents,
+    const std::vector<int>& argnums,
+    const std::vector<array>& outputs) {
+  // Y = A⁻¹.  dY = -A⁻¹ dA A⁻¹  ⇒  Ā = -A⁻ᵀ Ȳ A⁻ᵀ = -Yᵀ @ Ȳ @ Yᵀ
+  // (matches PyTorch linalg_inv_backward; no symmetrization — A is general).
+  auto s = stream();
+  auto Yt = swapaxes(outputs[0], -2, -1, s);
+  auto Abar = negative(matmul(matmul(Yt, cotangents[0], s), Yt, s), s);
+  // A triangular inverse only depends on the triangular part of A, so the
+  // gradient w.r.t. the off-triangle entries is zero.
+  if (tri_) {
+    Abar = upper_ ? triu(Abar, 0, s) : tril(Abar, 0, s);
+  }
+  return {Abar};
+}
+
 std::pair<std::vector<array>, std::vector<int>> View::vmap(
     const std::vector<array>& inputs,
     const std::vector<int>& axes) {

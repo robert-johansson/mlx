@@ -2458,6 +2458,12 @@ class Inverse : public UnaryPrimitive {
   void eval_cpu(const std::vector<array>& inputs, array& output) override;
   void eval_gpu(const std::vector<array>& inputs, array& output) override;
 
+  std::vector<array> vjp(
+      const std::vector<array>& primals,
+      const std::vector<array>& cotangents,
+      const std::vector<int>& argnums,
+      const std::vector<array>& outputs) override;
+
   DEFINE_VMAP()
   DEFINE_NAME(Inverse)
   auto state() const {
