@@ -1,5 +1,7 @@
 // Copyright © 2023-2024 Apple Inc.
 
+#include <limits>
+
 #include "mlx/allocator.h"
 #include "mlx/backend/cpu/copy.h"
 #include "mlx/backend/cpu/encoder.h"
@@ -21,6 +23,14 @@ void general_inv(T* inv, int N) {
       /* ipiv = */ static_cast<int*>(ipiv.buffer.raw_ptr()),
       /* info = */ &info);
 
+  if (info > 0) {
+    // Singular matrix — the inverse does not exist. Fill with NaN instead of
+    // throwing: a throw here escapes the dispatched CPU task and aborts the
+    // process (uncatchable from the host). NaN matches the non-crashing
+    // behaviour autograd through a (near-)singular matrix relies on.
+    std::fill(inv, inv + N * N, std::numeric_limits<T>::quiet_NaN());
+    return;
+  }
   if (info != 0) {
     std::stringstream ss;
     ss << "[Inverse::eval_cpu] LU factorization failed with error code "
@@ -61,6 +71,10 @@ void general_inv(T* inv, int N) {
       /* lwork = */ &lwork,
       /* info = */ &info);
 
+  if (info > 0) {
+    std::fill(inv, inv + N * N, std::numeric_limits<T>::quiet_NaN());
+    return;
+  }
   if (info != 0) {
     std::stringstream ss;
     ss << "[Inverse::eval_cpu] inversion failed with error code " << info;
@@ -81,6 +95,19 @@ void tri_inv(T* inv, int N, bool upper) {
       /* lda = */ &N,
       /* info = */ &info);
 
+  if (info > 0) {
+    // Singular triangular matrix (a zero on the diagonal): NaN, not a throw —
+    // which would escape the dispatched CPU task and abort the process.
+    std::fill(inv, inv + N * N, std::numeric_limits<T>::quiet_NaN());
+    return;
+  }
+  if (info != 0) {
+    std::stringstream ss;
+    ss << "[Inverse::eval_cpu] triangular inversion failed with error code "
+       << info;
+    throw std::runtime_error(ss.str());
+  }
+
   // zero out the other triangle
   if (upper) {
     for (int i = 0; i < N; i++) {
@@ -92,13 +119,6 @@ void tri_inv(T* inv, int N, bool upper) {
       std::fill(inv + i + 1, inv + N, 0.0f);
       inv += N;
     }
-  }
-
-  if (info != 0) {
-    std::stringstream ss;
-    ss << "[Inverse::eval_cpu] triangular inversion failed with error code "
-       << info;
-    throw std::runtime_error(ss.str());
   }
 }
 
