@@ -196,6 +196,9 @@ class Device {
   bool memory_pools() const {
     return memory_pools_ == 1;
   }
+  bool integrated() const {
+    return integrated_ == 1;
+  }
 
  private:
   int device_;
@@ -205,6 +208,7 @@ class Device {
   int host_native_atomic_;
   int managed_memory_;
   int memory_pools_;
+  int integrated_;
   std::string device_name_;
 };
 
