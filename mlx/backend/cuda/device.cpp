@@ -52,11 +52,21 @@ Device::Device(int device) : device_(device) {
       &managed_memory_, cudaDevAttrManagedMemory, device_));
   CHECK_CUDA_ERROR(cudaDeviceGetAttribute(
       &memory_pools_, cudaDevAttrMemoryPoolsSupported, device_));
-  // On Jetson (Thor/iGPU) the cudaMallocAsync memory pool is capped well below
-  // total unified memory (~43GB observed), so large models OOM despite ample
-  // RAM. Setting MLX_CUDA_DISABLE_MEMPOOL forces the synchronous cudaMalloc /
-  // managed path (allocator.cpp), which can use the full unified pool.
-  if (std::getenv("MLX_CUDA_DISABLE_MEMPOOL")) {
+  CHECK_CUDA_ERROR(
+      cudaDeviceGetAttribute(&integrated_, cudaDevAttrIntegrated, device_));
+  // On Jetson (Thor / iGPU) the cudaMallocAsync memory pool is capped well below
+  // total unified memory (~40GB measured on the 128GB Thor), so large models OOM
+  // despite ample RAM. On an integrated GPU with concurrent managed access we
+  // disable the async pool by default: the allocator then falls back to
+  // synchronous cudaMalloc, which reaches the full unified pool with no decode
+  // bandwidth penalty. (cudaMallocManaged also reaches the full pool but measured
+  // ~21% slower for matvec decode on Thor, so we keep device memory.) This
+  // retires the MLX_CUDA_DISABLE_MEMPOOL workaround. Escape hatches:
+  // MLX_CUDA_FORCE_MEMPOOL re-enables the pool; MLX_CUDA_DISABLE_MEMPOOL still
+  // forces it off (e.g. on non-integrated devices).
+  bool integrated_unified = integrated_ == 1 && concurrent_managed_access_ == 1;
+  if ((integrated_unified || std::getenv("MLX_CUDA_DISABLE_MEMPOOL")) &&
+      std::getenv("MLX_CUDA_FORCE_MEMPOOL") == nullptr) {
     memory_pools_ = 0;
   }
 }
@@ -197,6 +207,7 @@ std::pair<int, int> get_graph_limits(Device& d) {
       break;
     case 900: // H100
     case 1000: // B200
+    case 1100: // Thor (sm_110, integrated Blackwell)
     case 1200: // Consumer Blackwell
       ops = 100;
       mb = 1000;
