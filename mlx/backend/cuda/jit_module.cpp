@@ -93,6 +93,36 @@ const std::vector<std::string>& include_path_args() {
       }
     }
     args.push_back(fmt::format("--include-path={}", path.string()));
+    // CUDA 12.4+ ships CCCL (the <cuda/std/*> headers the generated kernels
+    // include) inside the toolkit. On aarch64/sbsa it lives under
+    // targets/<arch>/include/cccl rather than the top-level include, which the
+    // bundled-CCCL probe above misses — so NVRTC fails with
+    // `cannot open source file "cuda/std/tuple"`. Add the toolkit's cccl include
+    // dir whenever it is actually present (harmless if CCCL was already found).
+    {
+      const char* home = std::getenv("CUDA_HOME");
+      if (!home) {
+        home = std::getenv("CUDA_PATH");
+      }
+      std::filesystem::path cuda_root =
+          home ? std::filesystem::path(home) : default_cuda_toolkit_path();
+      if (!cuda_root.empty()) {
+        std::vector<std::filesystem::path> cccl_cands = {
+            cuda_root / "include" / "cccl"};
+        auto targets = cuda_root / "targets";
+        if (std::filesystem::exists(targets)) {
+          for (const auto& e : std::filesystem::directory_iterator(targets)) {
+            cccl_cands.push_back(e.path() / "include" / "cccl");
+          }
+        }
+        for (const auto& cand : cccl_cands) {
+          if (std::filesystem::exists(cand / "cuda" / "std" / "tuple")) {
+            args.push_back(fmt::format("--include-path={}", cand.string()));
+            break;
+          }
+        }
+      }
+    }
     return args;
   }();
   return cached_args;
