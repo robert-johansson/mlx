@@ -39,6 +39,7 @@ option(MLX_BUILD_CUDA "Build cuda backend" OFF)
 option(MLX_METAL_DEBUG "Enhance metal debug workflow" OFF)
 option(MLX_ENABLE_X64_MAC "Enable building for x64 macOS" OFF)
 option(MLX_BUILD_GGUF "Include support for GGUF format" ON)
+option(MLX_BUILD_JACCL "Build the JACCL Thunderbolt-RDMA distributed backend (macOS, SDK >= 26.2)" ON)
 option(MLX_BUILD_SAFETENSORS "Include support for safetensors format" ON)
 option(MLX_BUILD_PYTHON_STUBS "Build stub files for python bindings" ON)
 option(MLX_METAL_JIT "Use JIT compilation for Metal kernels" OFF)
@@ -342,7 +343,8 @@ target_include_directories(
   mlx PRIVATE $<BUILD_INTERFACE:${json_SOURCE_DIR}/single_include/nlohmann>)
 
 # Add standalone JACCL library (RDMA over Thunderbolt distributed backend)
-if(MLX_BUILD_CPU
+if(MLX_BUILD_JACCL
+   AND MLX_BUILD_CPU
    AND ${CMAKE_SYSTEM_NAME} MATCHES "Darwin"
    AND DEFINED MACOS_SDK_VERSION
    AND MACOS_SDK_VERSION GREATER_EQUAL 26.2)
