@@ -290,9 +290,26 @@ void CudaAllocator::move_to_unified_memory(
   cudaMemcpyKind kind =
       supports_managed_memory() ? cudaMemcpyDefault : cudaMemcpyDeviceToHost;
   if (stream && mem_pools_[buf.device]) {
+    // Pooled (discrete GPU): async copy + async free, both ordered on `stream`.
     CHECK_CUDA_ERROR(cudaMemcpyAsync(data, buf.data, buf.size, kind, stream));
     free_async(buf, stream);
+  } else if (stream) {
+    // No memory pools (integrated Tegra/Thor): the producer that wrote `buf`
+    // ran on `stream`, which is created with cudaStreamNonBlocking and is NOT
+    // implicitly synchronized by the legacy default stream. A plain
+    // default-stream cudaMemcpy (the old `else` path) therefore raced the
+    // still-running producer and copied stale/partial device memory, corrupting
+    // CPU-side linalg that consumes an unmaterialized GPU result (e.g. QR over a
+    // lazy gather -> garbage / -Inf). Copy on the SAME stream so the transfer is
+    // ordered AFTER the producer, then block until it completes before the now
+    // host-visible buffer is consumed by a CPU op or the old device buffer is
+    // synchronously freed (free_async is a synchronous cudaFree without pools).
+    CHECK_CUDA_ERROR(cudaMemcpyAsync(data, buf.data, buf.size, kind, stream));
+    CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
+    free_async(buf);
   } else {
+    // No producing stream is known (host-read boundary): the producer stream
+    // has already been finalized by eval before host access.
     CHECK_CUDA_ERROR(cudaMemcpy(data, buf.data, buf.size, kind));
     free_async(buf);
   }
