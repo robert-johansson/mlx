@@ -73,6 +73,32 @@ const std::vector<std::string>& include_path_args() {
     if (std::filesystem::exists(path)) {
       args.push_back(fmt::format("--include-path={}", path.string()));
     }
+    // Add path to CUTLASS (CuTe) headers. The JIT-compiled quantized-matmul
+    // kernels `#include <cute/...>`; a from-source addon (loaded binary not
+    // colocated with <prefix>/include) can't find them via the root_dir/include
+    // probe above, so fall back to the baked-in CUTLASS source dir.
+#if defined(MLX_CUTLASS_DIR)
+    {
+      std::filesystem::path cutlass_dir = MLX_CUTLASS_DIR;
+      if (std::filesystem::exists(
+              cutlass_dir / "cute" / "numeric" / "numeric_types.hpp")) {
+        args.push_back(fmt::format("--include-path={}", cutlass_dir.string()));
+      }
+    }
+#endif
+    // Add path to CCCL headers unconditionally from the baked-in source dir. The
+    // gated probe above (root_dir/include/cccl, then MLX_CCCL_DIR only if that is
+    // missing) does not reliably add it for a from-source addon whose loaded
+    // binary is not colocated with <prefix>/include, so the JIT'd gather/scatter
+    // kernels fail to find <cuda/std/*>.
+#if defined(MLX_CCCL_DIR)
+    {
+      std::filesystem::path cccl_dir = MLX_CCCL_DIR;
+      if (std::filesystem::exists(cccl_dir / "cuda" / "std" / "tuple")) {
+        args.push_back(fmt::format("--include-path={}", cccl_dir.string()));
+      }
+    }
+#endif
     // Add path to CUDA runtime headers, try local-installed python package
     // first and then system-installed headers.
     path = root_dir.parent_path() / "nvidia" / "cuda_runtime" / "include";

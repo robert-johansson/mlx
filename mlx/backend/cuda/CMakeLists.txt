@@ -230,12 +230,11 @@ install(DIRECTORY ${cccl_SOURCE_DIR}/include/cuda
 install(DIRECTORY ${cccl_SOURCE_DIR}/include/nv
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/cccl)
 
-# The binary of C++ tests will not be installed so it can not find the CCCL
-# headers, and we have to hard-code the path.
-if(MLX_BUILD_TESTS)
-  target_compile_definitions(mlx
-                             PRIVATE MLX_CCCL_DIR="${cccl_SOURCE_DIR}/include")
-endif()
+# CCCL (and CUTLASS, below) JIT header paths are hard-coded via
+# target_compile_definitions after CUTLASS is fetched (see below). Needed by the
+# non-installed C++ test binaries AND by a from-source NAPI addon whose loaded
+# binary is not colocated with <prefix>/include, so NVRTC can locate
+# <cuda/std/...> and <cute/...> at runtime.
 
 # Use fixed version of NVTX.
 FetchContent_Declare(
@@ -291,3 +290,13 @@ install(DIRECTORY ${cutlass_SOURCE_DIR}/include/cute
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(DIRECTORY ${cutlass_SOURCE_DIR}/include/cutlass
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+# Hard-code the CCCL + CUTLASS source include dirs so the runtime NVRTC JIT
+# resolves <cuda/std/*> and <cute/*> even when the loaded binary is not colocated
+# with <prefix>/include (a from-source NAPI addon, or a non-installed C++ test).
+# jit_module.cpp is the only reader; mirrors upstream's MLX_CCCL_DIR mechanism
+# (which upstream only defines under MLX_BUILD_TESTS — insufficient for the addon).
+target_compile_definitions(
+  mlx PRIVATE
+  MLX_CCCL_DIR="${cccl_SOURCE_DIR}/include"
+  MLX_CUTLASS_DIR="${cutlass_SOURCE_DIR}/include")
