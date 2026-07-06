@@ -587,9 +587,22 @@ CommandEncoder& get_command_encoder(Stream s) {
     auto& global_encoders = get_global_command_encoders();
     it = global_encoders.find(s.index);
     if (it == global_encoders.end()) {
-      throw std::runtime_error(
-          fmt::format(
-              "There is no Stream(gpu, {}) in current thread.", s.index));
+      // Lazily give the CURRENT thread its own encoder for this stream —
+      // exactly what gpu::new_stream does on the creating thread. Under
+      // node/libuv the thread that first touches the GPU (and thereby
+      // creates the default stream) is often a rotating pool worker, while
+      // later evals run on the napi main thread or another worker; the
+      // registry being thread_local made those evals throw here, and the
+      // throw unwound through an unguarded extern "C" eval frame straight
+      // to std::terminate (genmlx-isws: GRPO training aborted on CUDA).
+      // Each thread gets an independent CommandEncoder over the same
+      // underlying CUDA stream; commits are ordered by the stream itself.
+      // make_current first: unlike gpu::eval, the finalize/synchronize
+      // entry points reach here WITHOUT establishing the CUDA context on
+      // this thread, and the encoder's stream/graph construction needs it.
+      auto& d = cu::device(s.device);
+      d.make_current();
+      it = encoders.try_emplace(s.index, d).first;
     }
   }
   return it->second;
