@@ -7,8 +7,11 @@
 
 #include <fmt/format.h>
 #include <nvtx3/nvtx3.hpp>
+#include <cstdio>
 #include <future>
 #include <unordered_set>
+
+#include <pthread.h> // genmlx-kfli instrumentation (thread ids in probes)
 
 namespace mlx::core::cu {
 
@@ -85,6 +88,24 @@ void Device::make_current() {
   }
 }
 
+// genmlx-kfli instrumentation: depth of active CaptureContext windows on this
+// thread. The allocator's sync cudaMalloc/cudaFree probes (capture-prohibited
+// calls) extern-declare this to log when they fire inside a capture window.
+int& thread_capture_depth() {
+  static thread_local int depth = 0;
+  return depth;
+}
+
+// genmlx-kfli: a capture that failed in ~CaptureContext (a noexcept context —
+// throwing there is a guaranteed std::terminate). The error is recorded here
+// and rethrown from this thread's next commit(), an ordinary function whose
+// throw the mlx-sys shim guards can catch. Encoders are per-thread, so a
+// thread_local carries exactly the failing encoder's state.
+std::string& thread_pending_capture_error() {
+  static thread_local std::string err;
+  return err;
+}
+
 CommandEncoder::CaptureContext::CaptureContext(CommandEncoder& enc) : enc(enc) {
   enc.device().make_current();
   if (!use_cuda_graphs()) {
@@ -92,6 +113,7 @@ CommandEncoder::CaptureContext::CaptureContext(CommandEncoder& enc) : enc(enc) {
   }
   CHECK_CUDA_ERROR(
       cudaStreamBeginCapture(enc.stream(), cudaStreamCaptureModeThreadLocal));
+  ++thread_capture_depth(); // genmlx-kfli instrumentation
 }
 
 CommandEncoder::CaptureContext::~CaptureContext() {
@@ -100,7 +122,43 @@ CommandEncoder::CaptureContext::~CaptureContext() {
     return;
   }
 
-  graph.end_capture(enc.stream());
+  // genmlx-kfli: this destructor is implicitly noexcept — any throw here is a
+  // guaranteed std::terminate (the observed GRPO training abort). End the
+  // capture without throwing, log the full diagnostic state on failure, and
+  // defer the error to the next commit() where it is catchable.
+  --thread_capture_depth();
+  cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+  cudaError_t query_err = cudaStreamIsCapturing(enc.stream(), &status);
+  cudaGraph_t raw = nullptr;
+  cudaError_t err = cudaStreamEndCapture(enc.stream(), &raw);
+  graph = CudaGraph(raw); // take ownership so the RAII destroy still runs
+  if (err != cudaSuccess || status != cudaStreamCaptureStatusActive) {
+    fprintf(
+        stderr,
+        "[genmlx-kfli] EndCapture anomaly: end=%s(%d) pre-status=%d(query=%s)"
+        " tid=%lu stream=%p discard=%d depth-after=%d\n",
+        cudaGetErrorString(err),
+        (int)err,
+        (int)status,
+        cudaGetErrorString(query_err),
+        (unsigned long)pthread_self(),
+        (void*)enc.stream().operator cudaStream_t(),
+        (int)discard,
+        thread_capture_depth());
+  }
+  if (err != cudaSuccess) {
+    cudaGetLastError(); // clear the sticky error so later calls see clean state
+    if (!discard) {
+      thread_pending_capture_error() = fmt::format(
+          "[CUDA graph capture failed] cudaStreamEndCapture: {} "
+          "(pre-status={}; a capture-prohibited call — e.g. sync cudaMalloc/"
+          "cudaFree on the pool-less integrated path — likely invalidated the "
+          "capture; see genmlx-kfli)",
+          cudaGetErrorString(err),
+          (int)status);
+    }
+    return; // graph handle is invalid — do not add it as a node
+  }
   if (discard) {
     return;
   }
@@ -480,6 +538,12 @@ bool CommandEncoder::needs_commit() {
 
 void CommandEncoder::commit() {
   nvtx3::scoped_range r("CommandEncoder::commit");
+  if (!thread_pending_capture_error().empty()) {
+    // genmlx-kfli: deferred from ~CaptureContext on this thread
+    auto msg = std::move(thread_pending_capture_error());
+    thread_pending_capture_error().clear();
+    throw std::runtime_error(msg);
+  }
   if (!temporaries_.empty()) {
     add_completed_handler([temporaries = std::move(temporaries_)]() {});
   }
@@ -603,6 +667,13 @@ CommandEncoder& get_command_encoder(Stream s) {
       auto& d = cu::device(s.device);
       d.make_current();
       it = encoders.try_emplace(s.index, d).first;
+      fprintf(
+          stderr,
+          "[genmlx-kfli] lazily created per-thread encoder: stream-index=%d"
+          " tid=%lu (new cudaStream %p — NOT the creating thread's stream)\n",
+          s.index,
+          (unsigned long)pthread_self(),
+          (void*)it->second.stream().operator cudaStream_t());
     }
   }
   return it->second;
