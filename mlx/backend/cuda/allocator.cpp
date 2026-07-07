@@ -10,6 +10,7 @@
 
 #include <cuda_runtime.h>
 #include <fmt/format.h>
+#include <pthread.h> // genmlx-kfli instrumentation
 
 #include <cassert>
 #include <fstream>
@@ -18,6 +19,8 @@
 namespace mlx::core {
 
 namespace cu {
+
+int& thread_capture_depth(); // genmlx-kfli: defined in device.cpp
 
 constexpr int page_size = 16384;
 
@@ -64,6 +67,13 @@ inline void* unified_malloc(size_t size) {
 
 inline void unified_free(void* data) {
   if (supports_managed_memory()) {
+    if (thread_capture_depth() > 0) { // genmlx-kfli instrumentation
+      fprintf(
+          stderr,
+          "[genmlx-kfli] SYNC cudaFree DURING CAPTURE (depth=%d) tid=%lu\n",
+          thread_capture_depth(),
+          (unsigned long)pthread_self());
+    }
     CHECK_CUDA_ERROR(cudaFree(data));
   } else {
     CHECK_CUDA_ERROR(cudaFreeHost(data));
@@ -205,6 +215,15 @@ CudaAllocator::malloc_async(size_t size, int device, cudaStream_t stream) {
         if (mem_pools_[device]) { // supports memory pools
           CHECK_CUDA_ERROR(cudaMallocAsync(&data, size, stream));
         } else {
+          if (thread_capture_depth() > 0) { // genmlx-kfli instrumentation
+            fprintf(
+                stderr,
+                "[genmlx-kfli] SYNC cudaMalloc(%zu) DURING CAPTURE (depth=%d)"
+                " tid=%lu — capture-prohibited call, will invalidate\n",
+                size,
+                thread_capture_depth(),
+                (unsigned long)pthread_self());
+          }
           CHECK_CUDA_ERROR(cudaMalloc(&data, size));
         }
       }
@@ -338,7 +357,14 @@ void CudaAllocator::free_async(CudaBuffer& buf, cudaStream_t stream) {
       }
       CHECK_CUDA_ERROR(cudaFreeAsync(buf.data, stream));
     } else {
-      CHECK_CUDA_ERROR(cudaFree(buf.data));
+      if (thread_capture_depth() > 0) { // genmlx-kfli instrumentation
+      fprintf(
+          stderr,
+          "[genmlx-kfli] SYNC cudaFree DURING CAPTURE (depth=%d) tid=%lu\n",
+          thread_capture_depth(),
+          (unsigned long)pthread_self());
+    }
+    CHECK_CUDA_ERROR(cudaFree(buf.data));
     }
   }
 }
