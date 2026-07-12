@@ -263,6 +263,18 @@ CUTE_DEVICE void qmm_sm80_mainloop(
   }
 
   // Epilogue.
+  // Drain ALL outstanding cp_async groups before reusing the smem union for
+  // the C tile. The mainloop's last cp_async_wait<K_PIPE_MAX - 2> leaves up
+  // to one group still in flight (the clamped last-tile refetch issued at
+  // block 0 of the final tile), and __syncthreads() does NOT order cp_async
+  // completion — so without this wait a late-landing A-slot copy can land in
+  // smem AFTER the C tile is staged below (epilogue.C aliases mainloop.A/B
+  // in the SharedStorage union), corrupting a handful of staged C values.
+  // Timing-dependent, so outputs were run-to-run NONDETERMINISTIC — observed
+  // as the quantized-MoE expert-path jitter on the down-projection shape
+  // (genmlx-mdet; standalone repro: genmlx bench/qmm_down_repro.cljs).
+  cp_async_wait<0>();
+  __syncthreads();
   CUTE_UNROLL
   for (int i = 0; i < size(tCrC_accu); i++) {
     tCrC(i) = Element(tCrC_accu(i));
