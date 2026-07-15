@@ -26,6 +26,10 @@ class CommandEncoder {
     CudaGraph graph;
     CommandEncoder& enc;
     bool discard{false};
+    // Snapshot of graphs_enabled() at construction so Begin/EndCapture stay
+    // paired even if the encoder enters graph fallback mid-scope
+    // (genmlx-5wrl).
+    bool capturing_{false};
   };
   struct ConcurrentContext {
     ConcurrentContext(CommandEncoder& enc);
@@ -159,6 +163,13 @@ class CommandEncoder {
   std::unordered_map<std::uintptr_t, GraphNode> node_map_;
   size_t bytes_in_graph_{0};
   bool is_graph_updatable_{true};
+  // genmlx-5wrl: set when CUDA graph construction fails mid-eval; the rest of
+  // the eval runs through the (pre-existing) eager branches. Reset by
+  // commit() so the next eval tries graphs again.
+  bool graph_fallback_{false};
+  bool graphs_enabled() const;
+  void enter_graph_fallback(const char* reason);
+  void reset_graph_state();
   int max_ops_per_graph_;
   int max_mb_per_graph_;
 };

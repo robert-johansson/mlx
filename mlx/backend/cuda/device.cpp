@@ -108,7 +108,8 @@ std::string& thread_pending_capture_error() {
 
 CommandEncoder::CaptureContext::CaptureContext(CommandEncoder& enc) : enc(enc) {
   enc.device().make_current();
-  if (!use_cuda_graphs()) {
+  capturing_ = enc.graphs_enabled();
+  if (!capturing_) {
     return;
   }
   CHECK_CUDA_ERROR(
@@ -117,7 +118,7 @@ CommandEncoder::CaptureContext::CaptureContext(CommandEncoder& enc) : enc(enc) {
 }
 
 CommandEncoder::CaptureContext::~CaptureContext() {
-  if (!use_cuda_graphs()) {
+  if (!capturing_) {
     enc.node_count_++;
     return;
   }
@@ -172,7 +173,7 @@ CommandEncoder::ConcurrentContext::ConcurrentContext(CommandEncoder& enc)
 
 CommandEncoder::ConcurrentContext::~ConcurrentContext() {
   enc.in_concurrent_ = false;
-  if (!use_cuda_graphs()) {
+  if (!enc.graphs_enabled()) {
     return;
   }
 
@@ -298,7 +299,7 @@ void CommandEncoder::add_completed_handler(std::function<void()> task) {
 }
 
 void CommandEncoder::set_input_array(const array& arr) {
-  if (!use_cuda_graphs()) {
+  if (!graphs_enabled()) {
     return;
   }
   bytes_in_graph_ += arr.data_size();
@@ -307,7 +308,7 @@ void CommandEncoder::set_input_array(const array& arr) {
 }
 
 void CommandEncoder::set_output_array(const array& arr) {
-  if (!use_cuda_graphs()) {
+  if (!graphs_enabled()) {
     return;
   }
 
@@ -326,7 +327,7 @@ void CommandEncoder::add_kernel_node_raw(
   bool use_cluster = !is_empty_dim(cluster_dim);
   assert(!use_cluster || device_.compute_capability_major() >= 9);
 
-  if (!use_cuda_graphs()) {
+  if (!graphs_enabled()) {
     node_count_++;
     cudaLaunchConfig_t config = {};
     config.gridDim = grid_dim;
@@ -353,6 +354,12 @@ void CommandEncoder::add_kernel_node_raw(
   kernel_params.kernelParams = params;
   kernel_params.sharedMemBytes = smem_bytes;
   cudaGraphNode_t node = add_kernel_node_raw(kernel_params);
+  if (node == nullptr) {
+    // Graph fallback engaged inside the raw adder: relaunch this kernel
+    // through the eager branch (graphs_enabled() is now false).
+    add_kernel_node_raw(func, grid_dim, block_dim, cluster_dim, smem_bytes, params);
+    return;
+  }
   if (use_cluster) {
     cudaKernelNodeAttrValue attr = {};
     attr.clusterDim.x = cluster_dim.x;
@@ -373,7 +380,7 @@ void CommandEncoder::add_kernel_node_raw(
   bool use_cluster = !is_empty_dim(cluster_dim);
   assert(!use_cluster || device_.compute_capability_major() >= 9);
 
-  if (!use_cuda_graphs()) {
+  if (!graphs_enabled()) {
     node_count_++;
     CUlaunchConfig config = {};
     config.gridDimX = grid_dim.x;
@@ -408,6 +415,10 @@ void CommandEncoder::add_kernel_node_raw(
   kernel_params.kernelParams = params;
   kernel_params.sharedMemBytes = smem_bytes;
   CUgraphNode node = add_kernel_node_raw(kernel_params);
+  if (node == nullptr) {
+    add_kernel_node_raw(func, grid_dim, block_dim, cluster_dim, smem_bytes, params);
+    return;
+  }
   if (use_cluster) {
     CUlaunchAttributeValue attr = {};
     attr.clusterDim.x = cluster_dim.x;
@@ -421,7 +432,12 @@ void CommandEncoder::add_kernel_node_raw(
 cudaGraphNode_t CommandEncoder::add_kernel_node_raw(
     const cudaKernelNodeParams& params) {
   cudaGraphNode_t node;
-  CHECK_CUDA_ERROR(cudaGraphAddKernelNode(&node, graph_, NULL, 0, &params));
+  cudaError_t err = cudaGraphAddKernelNode(&node, graph_, NULL, 0, &params);
+  if (err != cudaSuccess) {
+    (void)cudaGetLastError(); // clear the sticky error
+    enter_graph_fallback(cudaGetErrorString(err));
+    return nullptr;
+  }
   insert_graph_dependencies(GraphNode{node, "K"});
   return node;
 }
@@ -429,7 +445,14 @@ cudaGraphNode_t CommandEncoder::add_kernel_node_raw(
 CUgraphNode CommandEncoder::add_kernel_node_raw(
     const CUDA_KERNEL_NODE_PARAMS& params) {
   CUgraphNode node;
-  CHECK_CUDA_ERROR(cuGraphAddKernelNode(&node, graph_, NULL, 0, &params));
+  CUresult res = cuGraphAddKernelNode(&node, graph_, NULL, 0, &params);
+  if (res != CUDA_SUCCESS) {
+    (void)cudaGetLastError();
+    const char* err_str = nullptr;
+    cuGetErrorString(res, &err_str);
+    enter_graph_fallback(err_str ? err_str : "cuGraphAddKernelNode failed");
+    return nullptr;
+  }
   insert_graph_dependencies(GraphNode{node, "K"});
   return node;
 }
@@ -498,42 +521,118 @@ std::pair<std::string, bool> subgraph_to_key(cudaGraph_t graph) {
 }
 
 void CommandEncoder::add_graph_node(cudaGraph_t child) {
-  if (!use_cuda_graphs()) {
-    node_count_++;
-    CudaGraphExec graph_exec;
-    graph_exec.instantiate(child);
-    device_.make_current();
-    CHECK_CUDA_ERROR(cudaGraphLaunch(graph_exec, stream()));
-    return;
+  if (graphs_enabled()) {
+    cudaGraphNode_t node;
+    auto [sub_graph_key, is_updatable] = subgraph_to_key(child);
+    cudaError_t err = cudaGraphAddChildGraphNode(&node, graph_, NULL, 0, child);
+    if (err == cudaSuccess) {
+      is_graph_updatable_ &= is_updatable;
+      insert_graph_dependencies(GraphNode{node, sub_graph_key});
+      return;
+    }
+    (void)cudaGetLastError();
+    enter_graph_fallback(cudaGetErrorString(err));
   }
-  cudaGraphNode_t node;
-  auto [sub_graph_key, is_updatable] = subgraph_to_key(child);
-  is_graph_updatable_ &= is_updatable;
-  CHECK_CUDA_ERROR(cudaGraphAddChildGraphNode(&node, graph_, NULL, 0, child));
-  insert_graph_dependencies(GraphNode{node, sub_graph_key});
+  node_count_++;
+  CudaGraphExec graph_exec;
+  graph_exec.instantiate(child);
+  device_.make_current();
+  CHECK_CUDA_ERROR(cudaGraphLaunch(graph_exec, stream()));
 }
 
 void CommandEncoder::add_graph_node(
     cudaGraph_t child,
     const std::string& subgraph_key,
     bool is_updatable) {
-  if (!use_cuda_graphs()) {
-    node_count_++;
-    CudaGraphExec graph_exec;
-    graph_exec.instantiate(child);
-    device_.make_current();
-    CHECK_CUDA_ERROR(cudaGraphLaunch(graph_exec, stream()));
-    return;
+  if (graphs_enabled()) {
+    cudaGraphNode_t node;
+    cudaError_t err = cudaGraphAddChildGraphNode(&node, graph_, NULL, 0, child);
+    if (err == cudaSuccess) {
+      is_graph_updatable_ &= is_updatable;
+      insert_graph_dependencies(GraphNode{node, subgraph_key});
+      return;
+    }
+    (void)cudaGetLastError();
+    enter_graph_fallback(cudaGetErrorString(err));
   }
-  is_graph_updatable_ &= is_updatable;
-  cudaGraphNode_t node;
-  CHECK_CUDA_ERROR(cudaGraphAddChildGraphNode(&node, graph_, NULL, 0, child));
-  insert_graph_dependencies(GraphNode{node, subgraph_key});
+  node_count_++;
+  CudaGraphExec graph_exec;
+  graph_exec.instantiate(child);
+  device_.make_current();
+  CHECK_CUDA_ERROR(cudaGraphLaunch(graph_exec, stream()));
 }
 
 bool CommandEncoder::needs_commit() {
   return (node_count_ > max_ops_per_graph_) ||
       ((bytes_in_graph_ >> 20) > max_mb_per_graph_);
+}
+
+bool CommandEncoder::graphs_enabled() const {
+  return use_cuda_graphs() && !graph_fallback_;
+}
+
+void CommandEncoder::reset_graph_state() {
+  from_nodes_.clear();
+  to_nodes_.clear();
+  graph_deps_key_.clear();
+  graph_nodes_key_.clear();
+  node_map_.clear();
+  graph_ = CudaGraph(device_);
+  is_graph_updatable_ = true;
+}
+
+// genmlx-5wrl: a CUDA graph node add failed (observed in the wild as
+// `cuGraphAddKernelNode: invalid argument` after ~30 distinct prefill-shape
+// variants). Instead of aborting the process, launch everything queued in
+// the partial graph (it is valid — the failing node was never added), then
+// run the REMAINDER of this eval through the pre-existing eager branches by
+// flipping graphs_enabled() off until commit(). Stream order is preserved:
+// the flushed partial graph and the subsequent eager launches serialize on
+// the same stream.
+void CommandEncoder::enter_graph_fallback(const char* reason) {
+  if (graph_fallback_) {
+    return;
+  }
+  graph_fallback_ = true; // set FIRST: if the flush throws, we stay eager
+  static bool warned = false;
+  if (!warned) {
+    warned = true;
+    std::cerr << fmt::format(
+        "[mlx] CUDA graph construction failed ({}); falling back to "
+        "graph-less execution for the current eval. Set "
+        "MLX_CUDA_GRAPH_CACHE_SIZE to pre-size the graph cache, or "
+        "MLX_USE_CUDA_GRAPHS=0 to disable graphs entirely.\n",
+        reason ? reason : "unknown error");
+  }
+  if (node_count_ > 0) {
+    if (!from_nodes_.empty()) {
+#if CUDART_VERSION >= 13000
+      CHECK_CUDA_ERROR(cudaGraphAddDependencies(
+          graph_,
+          from_nodes_.data(),
+          to_nodes_.data(),
+          nullptr, // edgeData
+          from_nodes_.size()));
+#else
+      CHECK_CUDA_ERROR(cudaGraphAddDependencies(
+          graph_, from_nodes_.data(), to_nodes_.data(), from_nodes_.size()));
+#endif
+    }
+    device_.make_current();
+    CudaGraphExec graph_exec;
+    try {
+      graph_exec.instantiate(graph_);
+    } catch (const std::exception&) {
+      // Same eviction rescue as commit(): cached execs are the classic
+      // resource hog. A second failure is an honest throw — the queued
+      // kernels cannot be recovered from graph nodes.
+      (void)cudaGetLastError();
+      graph_cache_.clear();
+      graph_exec.instantiate(graph_);
+    }
+    CHECK_CUDA_ERROR(cudaGraphLaunch(graph_exec, stream_));
+  }
+  reset_graph_state();
 }
 
 void CommandEncoder::commit() {
@@ -547,7 +646,7 @@ void CommandEncoder::commit() {
   if (!temporaries_.empty()) {
     add_completed_handler([temporaries = std::move(temporaries_)]() {});
   }
-  if (use_cuda_graphs() && node_count_ > 0) {
+  if (graphs_enabled() && node_count_ > 0) {
     if (!from_nodes_.empty()) {
 #if CUDART_VERSION >= 13000
       CHECK_CUDA_ERROR(cudaGraphAddDependencies(
@@ -566,10 +665,21 @@ void CommandEncoder::commit() {
 
     if (!is_graph_updatable_) {
       CudaGraphExec graph_exec;
-      graph_exec.instantiate(graph_);
+      try {
+        graph_exec.instantiate(graph_);
+      } catch (const std::exception&) {
+        // Instantiation failure under pressure is classically caused by the
+        // accumulated instantiated graphs in the cache — evict them all and
+        // retry once before giving up (genmlx-5wrl).
+        (void)cudaGetLastError();
+        graph_cache_.clear();
+        graph_exec.instantiate(graph_);
+      }
       CHECK_CUDA_ERROR(cudaGraphLaunch(graph_exec, stream_));
     } else {
       auto graph_key = graph_nodes_key_ + ":" + graph_deps_key_;
+      bool need_evict_retry = false;
+      {
       auto& graph_exec = graph_cache_[graph_key];
 
       if (graph_exec != nullptr) {
@@ -588,10 +698,29 @@ void CommandEncoder::commit() {
         }
       }
       if (graph_exec == nullptr) {
-        graph_exec.instantiate(graph_);
+        try {
+          graph_exec.instantiate(graph_);
+        } catch (const std::exception&) {
+          (void)cudaGetLastError();
+          need_evict_retry = true;
+        }
       }
-
-      CHECK_CUDA_ERROR(cudaGraphLaunch(graph_exec, stream_));
+      if (!need_evict_retry) {
+        CHECK_CUDA_ERROR(cudaGraphLaunch(graph_exec, stream_));
+      }
+      }
+      if (need_evict_retry) {
+        // graph_cache_.clear() frees every cached exec (and invalidates the
+        // slot reference above — hence the scope). Re-index for a fresh slot;
+        // a second failure here is an honest throw.
+        graph_cache_.clear();
+        auto& retry_exec = graph_cache_[graph_key];
+        retry_exec.instantiate(graph_);
+        CHECK_CUDA_ERROR(cudaGraphLaunch(retry_exec, stream_));
+        std::cerr << "[mlx] CUDA graph instantiation succeeded after evicting "
+                     "the graph cache; consider setting MLX_CUDA_GRAPH_CACHE_SIZE "
+                     "lower for this workload.\n";
+      }
     }
 
     // Save cuda graph to dot file
@@ -602,19 +731,15 @@ void CommandEncoder::commit() {
     }
 
     // Reset state
-    from_nodes_.clear();
-    to_nodes_.clear();
-    graph_deps_key_.clear();
-    graph_nodes_key_.clear();
-    node_map_.clear();
-    graph_ = CudaGraph(device_);
-    is_graph_updatable_ = true;
+    reset_graph_state();
   }
 
   // Put completion handlers in a batch.
   worker_->commit(stream_);
   node_count_ = 0;
   bytes_in_graph_ = 0;
+  // A graph fallback is per-eval: the next eval tries graphs again.
+  graph_fallback_ = false;
 }
 
 void CommandEncoder::synchronize() {
