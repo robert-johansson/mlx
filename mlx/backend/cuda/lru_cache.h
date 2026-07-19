@@ -37,6 +37,7 @@ class LRUCache {
       : LRUCache(env::get_var(env_name, default_capacity)) {
     if (env::get_var("MLX_ENABLE_CACHE_THRASHING_CHECK", 1)) {
       env_name_ = env_name;
+      max_capacity_ = 4 * capacity_;
     }
   }
 
@@ -96,20 +97,40 @@ class LRUCache {
     // graphs) keep running without manual tuning. The |env_name| override still
     // lets callers pre-size the cache, and MLX_ENABLE_CACHE_THRASHING_CHECK=0
     // disables auto-grow entirely (env_name_ stays null -> fixed-size LRU).
+    //
+    // Growth is CAPPED at 4x the configured capacity (genmlx-pnaw): cached
+    // values can hold driver-side memory the MLX allocator never sees (a
+    // cudaGraphExec_t retains its instantiation memory until destroyed), so a
+    // workload that never repeats a key — e.g. GRPO training, where every step
+    // brings a new prompt shape — would otherwise grow the cache, and that
+    // invisible memory, without bound. At the ceiling we fall back to honest
+    // LRU eviction: no abort, bounded retention, at worst re-instantiation
+    // churn for working sets larger than the ceiling.
     if (env_name_ && ++cache_misses_ > 2 * capacity_) {
-      size_t new_capacity = 2 * capacity_;
-      if (!grow_warned_) {
-        grow_warned_ = true;
+      cache_misses_ = 0;
+      if (capacity_ < max_capacity_) {
+        size_t new_capacity = std::min(2 * capacity_, max_capacity_);
+        if (!grow_warned_) {
+          grow_warned_ = true;
+          std::cerr << fmt::format(
+              "[mlx] Cache for {} is thrashing; growing capacity {} -> {}. "
+              "Set {} to pre-size the cache and avoid repeated growth.\n",
+              env_name_,
+              capacity_,
+              new_capacity,
+              env_name_);
+        }
+        resize(new_capacity);
+      } else if (!ceiling_warned_) {
+        ceiling_warned_ = true;
         std::cerr << fmt::format(
-            "[mlx] Cache for {} is thrashing; growing capacity {} -> {}. "
-            "Set {} to pre-size the cache and avoid repeated growth.\n",
+            "[mlx] Cache for {} reached its growth ceiling ({}); evicting "
+            "least-recently-used entries. Set {} to pre-size the cache if "
+            "performance degrades.\n",
             env_name_,
             capacity_,
-            new_capacity,
             env_name_);
       }
-      resize(new_capacity);
-      cache_misses_ = 0;
     }
 
     vlist_.emplace_front(key, std::forward<U>(value));
@@ -144,7 +165,9 @@ class LRUCache {
 
   const char* env_name_{nullptr};
   size_t cache_misses_{0};
+  size_t max_capacity_{0};
   bool grow_warned_{false};
+  bool ceiling_warned_{false};
 
   list_type vlist_;
   map_type map_;
