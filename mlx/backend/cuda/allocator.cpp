@@ -465,6 +465,12 @@ size_t get_memory_limit() {
 size_t get_cache_memory() {
   return cu::allocator().get_cache_memory();
 }
+size_t get_num_resources() {
+  return 0; // no per-buffer resource cap on CUDA
+}
+size_t get_resource_limit() {
+  return 0; // no per-buffer resource cap on CUDA
+}
 size_t set_cache_limit(size_t limit) {
   return cu::allocator().set_cache_limit(limit);
 }
