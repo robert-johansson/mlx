@@ -187,6 +187,12 @@ bool can_reuse_alien_buffer(void*) {
 size_t get_active_memory() {
   return allocator::common_allocator().get_active_memory();
 }
+size_t get_num_resources() {
+  return 0; // no per-buffer resource cap on this backend
+}
+size_t get_resource_limit() {
+  return 0; // no per-buffer resource cap on this backend
+}
 size_t get_peak_memory() {
   return allocator::common_allocator().get_peak_memory();
 }

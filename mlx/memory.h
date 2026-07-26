@@ -33,6 +33,21 @@ MLX_API void reset_peak_memory();
  * */
 MLX_API size_t get_cache_memory();
 
+/* Get the number of live GPU buffer resources (active + cached).
+ *
+ * On Metal each buffer counts toward the OS resource limit at which
+ * allocations fail; embedders use this to sweep proactively. Backends
+ * without a per-buffer resource cap (CUDA, no_gpu) return 0.
+ * */
+MLX_API size_t get_num_resources();
+
+/* Get the GPU buffer resource limit (the count at which allocations fail).
+ *
+ * Metal reads it from the OS (iogpu.rsrc_limit, ~499000). Backends without
+ * a per-buffer resource cap (CUDA, no_gpu) return 0.
+ * */
+MLX_API size_t get_resource_limit();
+
 /* Set the memory limit.
  * The memory limit is a guideline for the maximum amount of memory to use
  * during graph evaluation. If the memory limit is exceeded and there is no
