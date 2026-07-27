@@ -59,7 +59,12 @@ struct fp8_e8m0 {
       return;
     }
     float le = metal::log2(x);
-    int n = int(metal::round(le));
+    // Round the exponent UP, matching CUDA's cutlass float_ue8m0_t. Nearest
+    // rounding stores a scale up to sqrt(2) smaller than the amax/448
+    // candidate in ~half of groups, saturating their largest e4m3 elements
+    // at 448 and concentrating quantization error on the biggest weights
+    // (measured 2.1x worse rel-L2 than CUDA on router-gate shapes).
+    int n = int(metal::ceil(le));
 
     n = n < -127 ? -127 : n;
     n = n > 127 ? 127 : n;
