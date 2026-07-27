@@ -1855,7 +1855,10 @@ uint8_t to_fp8_e8m0(float x) {
     return 0x00;
   }
   float le = std::log2(x);
-  int n = int(std::round(le));
+  // Round the exponent UP, matching CUDA's cutlass float_ue8m0_t (see the
+  // same fix in metal/kernels/fp8.h): nearest rounding saturates the
+  // largest e4m3 elements in ~half of groups.
+  int n = int(std::ceil(le));
 
   n = n < -127 ? -127 : n;
   n = n > 127 ? 127 : n;
