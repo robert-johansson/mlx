@@ -305,6 +305,17 @@ void CudaAllocator::move_to_unified_memory(
   if (buf.device == -1) {
     return;
   }
+  // genmlx-7prh instrumentation: buffer migrations are what detach captured
+  // replay execs from their frozen kernel params, so make them observable.
+  static bool replay_debug = std::getenv("MLX_REPLAY_DEBUG") != nullptr;
+  if (replay_debug) {
+    fprintf(
+        stderr,
+        "[replay] move_to_unified buf=%p size=%zu stream=%p\n",
+        buf.data,
+        buf.size,
+        (void*)stream);
+  }
   void* data = unified_malloc(buf.size);
   cudaMemcpyKind kind =
       supports_managed_memory() ? cudaMemcpyDefault : cudaMemcpyDeviceToHost;
@@ -437,6 +448,10 @@ void* Buffer::raw_ptr() {
     return nullptr;
   }
   auto& cbuf = *static_cast<cu::CudaBuffer*>(ptr_);
+  static bool replay_debug = std::getenv("MLX_REPLAY_DEBUG") != nullptr;
+  if (cbuf.device != -1 && replay_debug) {
+    fprintf(stderr, "[replay] raw_ptr MIGRATES buf=%p\n", cbuf.data);
+  }
   cu::allocator().move_to_unified_memory(cbuf);
   return cbuf.data;
 }
