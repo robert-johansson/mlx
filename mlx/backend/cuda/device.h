@@ -8,6 +8,7 @@
 #include "mlx/backend/cuda/utils.h"
 #include "mlx/stream.h"
 
+#include <atomic>
 #include <memory>
 #include <unordered_map>
 
@@ -15,6 +16,16 @@ namespace mlx::core::cu {
 
 // Compute a key and updatability flag for a CUDA graph by walking its nodes.
 std::pair<std::string, bool> subgraph_to_key(cudaGraph_t graph);
+
+// ---- Replay-capture sink hooks (genmlx-7prh, replay_capture.cpp) ----------
+// While a capture window is open (gpu::replay_capture_begin), every commit
+// contributes an instantiated clone of its batch graph to the sink, every
+// encoder temporary is retained by it, and graph fallbacks invalidate it.
+// The flag keeps the closed-window fast path to one relaxed atomic load.
+extern std::atomic<bool> g_replay_sink_active;
+void replay_sink_on_commit(cudaGraph_t graph);
+void replay_sink_add_temporary(const std::shared_ptr<array::Data>& data);
+void replay_sink_invalidate(const char* reason);
 
 class Worker;
 
@@ -111,6 +122,11 @@ class CommandEncoder {
 
   void add_temporary(const array& arr) {
     temporaries_.push_back(arr.data_shared_ptr());
+    if (g_replay_sink_active.load(std::memory_order_relaxed)) {
+      // Open capture window: the buffer's pointer may be baked into a
+      // captured exec, so the sink must keep it alive past this eval.
+      replay_sink_add_temporary(arr.data_shared_ptr());
+    }
   }
 
   void add_completed_handler(std::function<void()> task);

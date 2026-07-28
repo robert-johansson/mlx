@@ -594,6 +594,11 @@ void CommandEncoder::enter_graph_fallback(const char* reason) {
     return;
   }
   graph_fallback_ = true; // set FIRST: if the flush throws, we stay eager
+  if (g_replay_sink_active.load(std::memory_order_acquire)) {
+    // genmlx-7prh: ops after this point run eagerly, so no exec can replay
+    // them — the capture window cannot represent this eval.
+    replay_sink_invalidate(reason);
+  }
   static bool warned = false;
   if (!warned) {
     warned = true;
@@ -646,6 +651,12 @@ void CommandEncoder::commit() {
   if (!temporaries_.empty()) {
     add_completed_handler([temporaries = std::move(temporaries_)]() {});
   }
+  if (g_replay_sink_active.load(std::memory_order_acquire) &&
+      node_count_ > 0 && !graphs_enabled()) {
+    // genmlx-7prh: these ops ran eagerly (graphs disabled or fallback), so
+    // the capture window missed them.
+    replay_sink_invalidate("CUDA graphs disabled during capture window");
+  }
   if (graphs_enabled() && node_count_ > 0) {
     if (!from_nodes_.empty()) {
 #if CUDART_VERSION >= 13000
@@ -662,6 +673,12 @@ void CommandEncoder::commit() {
     }
 
     device_.make_current();
+
+    if (g_replay_sink_active.load(std::memory_order_acquire)) {
+      // genmlx-7prh: the batch graph is complete (deps added) — clone it
+      // into the open capture window before launch/reset.
+      replay_sink_on_commit(graph_);
+    }
 
     if (!is_graph_updatable_) {
       CudaGraphExec graph_exec;
