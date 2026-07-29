@@ -239,12 +239,27 @@ void merge_one(array& dst, array& src, ParentsMap& parents_map) {
     pairs.push_back(parent);
   }
 
-  // If src is a parent of dst, remove it from dst's parents
-  for (auto it = pairs.begin(); it != pairs.end();) {
-    if (it->first.id() == src.id()) {
-      it = pairs.erase(it);
-    } else {
-      it++;
+  // If src is a parent of dst, remove it from dst's parents. src can only
+  // be a parent of dst when dst is one of src's inputs — check that in
+  // O(arity) before scanning dst's parents vector: the unconditional scan
+  // is O(|pairs|) per merge, and for a heavily-shared dst (a canonical
+  // scalar absorbing n duplicates in compile_simplify) that is O(n²) over
+  // a pass — measured as the residual super-linear compile time on long
+  // unrolled chains after the compile_fuse prune fix.
+  bool src_is_parent_of_dst = false;
+  for (auto& in : src.inputs()) {
+    if (in.id() == dst.id()) {
+      src_is_parent_of_dst = true;
+      break;
+    }
+  }
+  if (src_is_parent_of_dst) {
+    for (auto it = pairs.begin(); it != pairs.end();) {
+      if (it->first.id() == src.id()) {
+        it = pairs.erase(it);
+      } else {
+        it++;
+      }
     }
   }
   // Remove the source from the map to avoid fusing with it again
