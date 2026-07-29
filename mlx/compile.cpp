@@ -9,6 +9,7 @@
 
 #include "mlx/allocator.h"
 #include "mlx/backend/common/compiled.h"
+#include "mlx/backend/cuda/cuda.h"
 #include "mlx/compile.h"
 #include "mlx/compile_impl.h"
 #include "mlx/fast_primitives.h"
@@ -76,6 +77,43 @@ bool is_reduction(const Primitive& p) {
 
 bool is_fusable(const Primitive& p) {
   return is_unary(p) || is_binary(p) || is_ternary(p) || is_broadcast(p);
+}
+
+// Reduce-root fusion (genmlx-7dm0): a float32 Sum may act as a fusion ROOT,
+// pulling its elementwise producer chain into one Compiled whose tape ends
+// with the Reduce — codegen'd as a single fused reduce kernel. CUDA-only
+// (the Metal/CPU Compiled codegens are elementwise-only, so the admission
+// is gated on the CUDA backend + a GPU stream), and restricted to the
+// shapes the CUDA reduce builder handles: a full 1-D sum or a last-axis
+// sum of a 2-D domain (covers score/log-prob epilogues, cotangent
+// reductions and kinetic-energy sums; wider shapes stay unfused).
+bool is_reduce_fusion_root(const array& arr) {
+  static bool disabled = std::getenv("MLX_DISABLE_REDUCE_FUSION") != nullptr;
+  if (disabled) {
+    return false;
+  }
+  auto& p = arr.primitive();
+  if (typeid(p) != typeid(Reduce)) {
+    return false;
+  }
+  if (p.stream().device != Device::gpu || !cu::is_available()) {
+    return false;
+  }
+  auto [rt, axes] = static_cast<const Reduce&>(p).state();
+  if (rt != Reduce::Sum) {
+    return false;
+  }
+  auto& in = arr.inputs()[0];
+  if (in.dtype() != float32 || arr.dtype() != float32) {
+    return false;
+  }
+  int nd = in.ndim();
+  if (nd == 1) {
+    return axes == std::vector<int>{0};
+  } else if (nd == 2) {
+    return axes == std::vector<int>{1};
+  }
+  return false;
 }
 
 Compiled::Compiled(
@@ -796,11 +834,15 @@ void compile_simplify(
 
 // Extract sub-graphs of the graph that can be compiled
 // and replace them with a Compiled Primitive.
+// allow_reduce_roots admits float32 Sum roots (see is_reduce_fusion_root);
+// pass false under shapeless compilation — the reduce codegen derives its
+// row geometry from trace-time tape shapes.
 void compile_fuse(
     std::vector<array>& tape,
     ParentsMap& parents_map,
     const std::vector<array>& inputs,
-    std::vector<array>& outputs) {
+    std::vector<array>& outputs,
+    bool allow_reduce_roots = false) {
   // Track outputs to replace with new compiled outputs
   std::unordered_map<uintptr_t, array> output_map;
   for (auto& o : outputs) {
@@ -905,11 +947,31 @@ void compile_fuse(
       }
     };
 
+    // Reduce-root fusion (genmlx-7dm0): a qualifying Sum pulls its
+    // elementwise producer chain into the fused tape, itself last. The
+    // producers are fused in the reduce INPUT's domain; global outputs
+    // among them are declined outright (they would give the Compiled
+    // mixed output shapes) via a sentinel shape no real array has.
+    bool reduce_root = false;
+    if (allow_reduce_roots && arr.has_primitive() &&
+        is_reduce_fusion_root(arr)) {
+      Stream s = arr.primitive().stream();
+      cache.insert(arr.id());
+      recurse(arr.inputs()[0], 1, s, Shape{-1});
+      if (cache.size() >= 2) {
+        reduce_root = true;
+      } else {
+        // Nothing fusable feeds the reduce — abandon, take the plain path.
+        cache.clear();
+        input_set.clear();
+      }
+    }
+
     // This will be the result of the fused operation so it needs
     //   a) to not be already computed ie have a primitive
     //   b) that primitive to not be a broadcast since it will unnecessarily
     //      cast to a contiguous array potentially blowing up memory
-    if (arr.has_primitive() && !is_broadcast(arr.primitive())) {
+    if (!reduce_root && arr.has_primitive() && !is_broadcast(arr.primitive())) {
       Stream s = arr.primitive().stream();
       recurse(arr, 0, s, arr.shape());
     }
@@ -1173,9 +1235,11 @@ ArrayFnWithExtra compile(
       }
 
       // Kernel fusion to generate Compiled primitives. The tape and
-      // new outputs must be updated accordingly
+      // new outputs must be updated accordingly. Reduce roots only under
+      // shaped compilation — the reduce codegen reads trace-time shapes.
       if (mode != CompileMode::no_fuse) {
-        compile_fuse(entry.tape, parents_map, entry.inputs, entry.outputs);
+        compile_fuse(
+            entry.tape, parents_map, entry.inputs, entry.outputs, !shapeless);
       }
 
       // Debug census (MLX_COMPILE_DEBUG): tally the post-fusion tape by
