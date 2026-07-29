@@ -258,6 +258,19 @@ bool replay_capture_copy_into(void* handle, const array& dst, const array& src) 
       src.dtype() != dst.dtype()) {
     return false;
   }
+  // LAYOUT guard (genmlx-b1gx): this is a RAW byte copy, so src must have
+  // the same memory layout the captured kernels were traced against — the
+  // staged clone's. A row-major array fed where a transposed-view was
+  // captured passes every size check and lands every element in the wrong
+  // slot (the chunked N-chain MALA seam corruption: pooled tails shifted
+  // 1.99 -> 1.75). Same shape + same strides, or both row-contiguous with
+  // the same shape; anything else falls back to the plain path.
+  bool same_layout = src.shape() == dst.shape() && src.strides() == dst.strides();
+  bool both_rc = src.shape() == dst.shape() && src.flags().row_contiguous &&
+      dst.flags().row_contiguous;
+  if (!same_layout && !both_rc) {
+    return false;
+  }
   cu::sink_device().make_current();
   size_t bytes = src.data_size() * src.itemsize();
   // gpu_ptr for BOTH sides — see the migration note in clone_array above
