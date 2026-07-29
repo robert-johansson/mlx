@@ -116,6 +116,74 @@ bool is_reduce_fusion_root(const array& arr) {
   return false;
 }
 
+// Multi-consumer duplication (genmlx-o0ek): compile_fuse's all-parents-in
+// rule strands every producer shared across fusion regions as its own
+// kernel — the region declines it, takes its value as an input, and the
+// stranded producer's own upstream chain is cut off from fusing with the
+// consumers. Instead, a cheap elementwise producer that straddles the
+// region boundary is CLONED into the region (XLA's kDuplicate): in-region
+// consumers are rewired to the clone (which fuses), the original keeps its
+// outside consumers, and when the reverse tape walk reaches the last
+// consuming region the original's parents have all shrunk into that region
+// and it is absorbed outright — the standalone kernel disappears.
+// Recomputing a few elementwise ops per region is far cheaper than a
+// kernel launch in the launch-bound regime (~1.1 us/launch on sm_120).
+//
+// CUDA-only for now (mirrors is_reduce_fusion_root's gate; Metal/CPU keep
+// upstream behavior bit-for-bit), kill switch MLX_DISABLE_DUP_FUSION,
+// per-region clone budget MLX_DUP_FUSION_MAX (default
+// max_dup_per_region) on top of the existing depth and input-count caps.
+// Never through Matmul/Reduce/RandomBits/Gather/Scatter (not is_fusable,
+// so the recursion declines them before the duplication point) and never
+// a global output (its standalone kernel must survive anyway, so cloning
+// it saves nothing). Producers with more than max_dup_fanout parents are
+// declined: duplication into that many consumers bloats every kernel, and
+// bounding the parents-list scan keeps the pass linear over the tape (the
+// genmlx-geiw quadratic-compile invariant).
+constexpr int max_dup_per_region = 16;
+constexpr int max_dup_fanout = 16;
+
+int dup_fusion_budget() {
+  static int budget = []() {
+    if (std::getenv("MLX_DISABLE_DUP_FUSION")) {
+      return 0;
+    }
+    if (const char* v = std::getenv("MLX_DUP_FUSION_MAX")) {
+      return std::atoi(v);
+    }
+    return max_dup_per_region;
+  }();
+  return budget;
+}
+
+int dup_fusion_fanout() {
+  static int fanout = []() {
+    if (const char* v = std::getenv("MLX_DUP_FUSION_FANOUT")) {
+      return std::atoi(v);
+    }
+    return max_dup_fanout;
+  }();
+  return fanout;
+}
+
+// Duplication diagnostics, cumulative per thread (compilation is
+// per-thread — see compiler_cache), printed with the MLX_COMPILE_DEBUG
+// census. Telemetry only.
+struct DupStats {
+  int clones{0};
+  int candidates{0};
+  int skip_resolved{0};
+  int skip_unmixed{0};
+  int abort_budget{0};
+  int abort_fanout{0};
+  int abort_depth{0};
+  int abort_inputs{0};
+};
+DupStats& dup_stats() {
+  static thread_local DupStats stats;
+  return stats;
+}
+
 Compiled::Compiled(
     Stream stream,
     std::vector<array> inputs,
@@ -339,6 +407,25 @@ array split_one(
   }
 
   return y;
+}
+
+// Register a split_one clone as a parent of its inputs (genmlx-o0ek).
+// split_one rewires the in-divider consumers to the clone but leaves the
+// clone invisible in its inputs' parents lists, which stops a shared CHAIN
+// from duplicating: at the next level down, split_one would find no
+// in-cache entry to move and produce a dead clone. With the clone
+// registered, each level's split finds exactly the previous clone's entry,
+// moves it, and the cascade walks the chain while the original entries
+// stay with the outside consumers. Append-only on the inputs' lists (the
+// genmlx-geiw invariant); each registered entry is either moved into the
+// next clone's own list (erased with it at fusion completion) or survives
+// as a lazily-pruned stale entry of exactly the class compile_fuse already
+// tolerates.
+void register_clone(const array& y, ParentsMap& parents_map) {
+  auto& inputs = y.inputs();
+  for (int i = 0; i < static_cast<int>(inputs.size()); ++i) {
+    parents_map[inputs[i].id()].push_back({y, i});
+  }
 }
 
 template <typename T, typename... U>
@@ -880,6 +967,14 @@ void compile_fuse(
     std::function<void(const array&, int, const Stream&, const Shape&)> recurse;
     std::unordered_set<uintptr_t> cache;
     std::unordered_set<uintptr_t> input_set;
+    // Multi-consumer duplication state (genmlx-o0ek): candidates are
+    // recorded during the recursion and split only AFTER the region is
+    // final (dup_post_pass below) — vjp tapes are diamond-rich, and a
+    // node whose consumers all end up in the region resolves itself via
+    // the revisit mechanism; splitting inline would burn the budget on
+    // those false positives.
+    int dup_budget = dup_fusion_budget();
+    std::vector<std::pair<array, int>> dup_candidates;
     recurse = [&](const array& a,
                   int depth,
                   const Stream& s,
@@ -918,13 +1013,24 @@ void compile_fuse(
 
       // Arrays with a mix of parents outside the compilable section
       // are not fusable except for broadcast which we can split to avoid
-      // stopping fusion
+      // stopping fusion, and — on CUDA — cheap elementwise producers,
+      // which are recorded here and cloned into the region by
+      // dup_post_pass once the region is final (genmlx-o0ek).
       if (!all_parents_in) {
+        bool dup_on = dup_fusion_budget() > 0 && s.device == Device::gpu &&
+            cu::is_available();
         if (a.has_primitive() && is_broadcast(a.primitive()) &&
             input_set.size() < max_compile_arrays) {
           array b = split_one(a, parents_map, cache);
+          if (dup_on) {
+            register_clone(b, parents_map);
+          }
           recurse(b, depth, s, shape);
         } else {
+          if (dup_on && a.siblings().empty() &&
+              output_map.find(a.id()) == output_map.end()) {
+            dup_candidates.emplace_back(a, depth);
+          }
           // Possible input
           input_set.insert(a.id());
         }
@@ -947,6 +1053,152 @@ void compile_fuse(
       }
     };
 
+    // Multi-consumer duplication post-pass (genmlx-o0ek): re-examine the
+    // recorded candidates against the FINAL region. Candidates whose
+    // consumers all joined the region were already fused by the revisit
+    // mechanism (in cache — skip); the rest that still have live parents
+    // on both sides of the boundary are considered for cloning. Entries
+    // whose parent was fused away by an EARLIER region (global_cache) are
+    // dead and count on neither side: treating them as outside would
+    // split a node with no live outside consumer and orphan the original
+    // in the tape.
+    //
+    // Cloning is ALL-OR-NOTHING over the candidate's full fusable
+    // subtree. Every fusable node under the candidate has a live outside
+    // consumer by construction (the original parent chain stays live), so
+    // a partial clone would end mid-chain and force a NEW materialization
+    // boundary there — measured on the MALA tape as the shared forward
+    // score chain chopped at per-region budget-exhaustion points
+    // (4820 -> 5871 entries, the exact opposite of the goal). The
+    // feasibility walk therefore admits a candidate only when the whole
+    // subtree fits the clone budget, the depth cap, and the input-count
+    // cap (counting both new boundary inputs and the transient input_set
+    // entries the plan's own recursion inserts), so every clone boundary
+    // lands on an already-materialized value: a non-fusable producer, a
+    // global output, an existing region input, or a region-interior node.
+    // Candidates recorded by the plan's own recursion are dropped (the
+    // n_candidates cutoff): the plan already covers the subtree, and
+    // independent processing of its members is exactly the partial-clone
+    // chop.
+    //
+    // Every performed split commits: the clone's parents are the moved
+    // in-cache entries, its depth passed the cap when recorded, and the
+    // feasibility bound keeps the accept branch's input-count check
+    // passing — so the reduce-root abandon below can only fire when
+    // nothing was mutated.
+    auto dup_post_pass = [&](const Stream& s, const Shape& shape) {
+      auto& stats = dup_stats();
+      size_t n_candidates = dup_candidates.size();
+      for (size_t ci = 0; ci < n_candidates; ++ci) {
+        if (dup_budget <= 0) {
+          break;
+        }
+        stats.candidates++;
+        auto [cand, cand_depth] = dup_candidates[ci];
+        if (cache.find(cand.id()) != cache.end()) {
+          stats.skip_resolved++;
+          continue;
+        }
+        auto pit = parents_map.find(cand.id());
+        if (pit == parents_map.end()) {
+          stats.skip_unmixed++;
+          continue;
+        }
+        if (pit->second.size() > static_cast<size_t>(dup_fusion_fanout())) {
+          stats.abort_fanout++;
+          continue;
+        }
+        bool has_in = false;
+        bool has_out = false;
+        for (auto& [p, idx] : pit->second) {
+          if (cache.find(p.id()) != cache.end()) {
+            has_in = true;
+          } else if (global_cache.find(p.id()) == global_cache.end()) {
+            has_out = true;
+          }
+          if (has_in && has_out) {
+            break;
+          }
+        }
+        if (!has_in || !has_out) {
+          stats.skip_unmixed++;
+          continue;
+        }
+
+        // Feasibility walk: BFS the fusable subtree, collecting the clone
+        // plan (parent-first, so each split finds its consumer clone
+        // already registered) and the new boundary inputs.
+        std::vector<std::pair<array, int>> plan{{cand, cand_depth}};
+        std::unordered_set<uintptr_t> plan_set{cand.id()};
+        std::unordered_set<uintptr_t> boundary_new;
+        bool feasible = true;
+        for (size_t pi = 0; pi < plan.size() && feasible; ++pi) {
+          if (plan.size() > static_cast<size_t>(dup_budget)) {
+            stats.abort_budget++;
+            feasible = false;
+            break;
+          }
+          auto [n, nd] = plan[pi];
+          for (auto& in : n.inputs()) {
+            if (plan_set.find(in.id()) != plan_set.end() ||
+                cache.find(in.id()) != cache.end()) {
+              continue;
+            }
+            bool boundary = !in.has_primitive() ||
+                !is_fusable(in.primitive()) ||
+                in.primitive().stream() != s || !in.siblings().empty() ||
+                output_map.find(in.id()) != output_map.end();
+            if (!boundary) {
+              // A high-fanout producer can never satisfy all-parents-in
+              // anywhere, so it materializes in the final schedule
+              // regardless — take it as a plan boundary (an input, the
+              // baseline behavior) instead of aborting the plan. This
+              // also bounds split_one's parents-list scan (the
+              // genmlx-geiw invariant): only fanout-capped nodes are
+              // ever split.
+              auto ipit = parents_map.find(in.id());
+              if (ipit == parents_map.end() ||
+                  ipit->second.size() >
+                      static_cast<size_t>(dup_fusion_fanout())) {
+                boundary = true;
+              }
+            }
+            if (boundary) {
+              if (input_set.find(in.id()) == input_set.end()) {
+                boundary_new.insert(in.id());
+              }
+              continue;
+            }
+            if (nd + 1 >= max_compile_depth) {
+              stats.abort_depth++;
+              feasible = false;
+              break;
+            }
+            plan_set.insert(in.id());
+            plan.emplace_back(in, nd + 1);
+          }
+        }
+        if (!feasible) {
+          continue;
+        }
+        if (input_set.size() + boundary_new.size() + plan.size() >=
+            static_cast<size_t>(max_compile_arrays)) {
+          stats.abort_inputs++;
+          continue;
+        }
+        stats.clones += static_cast<int>(plan.size());
+
+        for (auto& [n, nd] : plan) {
+          array b = split_one(n, parents_map, cache);
+          register_clone(b, parents_map);
+          --dup_budget;
+          input_set.erase(n.id());
+          recurse(b, nd, s, shape);
+        }
+      }
+      dup_candidates.clear();
+    };
+
     // Reduce-root fusion (genmlx-7dm0): a qualifying Sum pulls its
     // elementwise producer chain into the fused tape, itself last. The
     // producers are fused in the reduce INPUT's domain; global outputs
@@ -958,6 +1210,7 @@ void compile_fuse(
       Stream s = arr.primitive().stream();
       cache.insert(arr.id());
       recurse(arr.inputs()[0], 1, s, Shape{-1});
+      dup_post_pass(s, Shape{-1});
       if (cache.size() >= 2) {
         reduce_root = true;
       } else {
@@ -974,6 +1227,7 @@ void compile_fuse(
     if (!reduce_root && arr.has_primitive() && !is_broadcast(arr.primitive())) {
       Stream s = arr.primitive().stream();
       recurse(arr, 0, s, arr.shape());
+      dup_post_pass(s, arr.shape());
     }
 
     // Not worth fusing a single primitive
@@ -1256,6 +1510,19 @@ ArrayFnWithExtra compile(
             stderr,
             "[compile] post-fusion tape: %zu entries\n",
             entry.tape.size());
+        auto& ds = dup_stats();
+        fprintf(
+            stderr,
+            "[compile] dup: clones=%d candidates=%d resolved=%d unmixed=%d "
+            "abort[budget=%d fanout=%d depth=%d inputs=%d] (cumulative)\n",
+            ds.clones,
+            ds.candidates,
+            ds.skip_resolved,
+            ds.skip_unmixed,
+            ds.abort_budget,
+            ds.abort_fanout,
+            ds.abort_depth,
+            ds.abort_inputs);
         for (auto& [name, cnt] : census) {
           fprintf(stderr, "[compile]   %6d  %s\n", cnt, name.c_str());
         }
