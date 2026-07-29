@@ -1178,6 +1178,25 @@ ArrayFnWithExtra compile(
         compile_fuse(entry.tape, parents_map, entry.inputs, entry.outputs);
       }
 
+      // Debug census (MLX_COMPILE_DEBUG): tally the post-fusion tape by
+      // primitive name — each tape entry is one kernel launch at eval, so
+      // this is the kernels-per-eval decomposition (genmlx-lnzc).
+      if (std::getenv("MLX_COMPILE_DEBUG")) {
+        std::map<std::string, int> census;
+        for (auto& a : entry.tape) {
+          if (a.has_primitive()) {
+            census[a.primitive().name()]++;
+          }
+        }
+        fprintf(
+            stderr,
+            "[compile] post-fusion tape: %zu entries\n",
+            entry.tape.size());
+        for (auto& [name, cnt] : census) {
+          fprintf(stderr, "[compile]   %6d  %s\n", cnt, name.c_str());
+        }
+      }
+
       // Mark the entry as filled only after every step above completed, so
       // a throwing first trace leaves the entry empty and a later call
       // re-traces cleanly instead of hitting a half-filled entry
