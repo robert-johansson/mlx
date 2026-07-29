@@ -44,6 +44,40 @@ __device__ rbits threefry2x32_hash(uint2 key, uint2 count) {
   return v;
 }
 
+// Word-store fast path (genmlx-nznb): the byte-store kernels below write
+// each thread's 8 hash bytes as EIGHT uint8 stores to two distant
+// locations — byte-granular, uncoalesced, measured ~30-45 GB/s effective
+// on sm_120 (~15x under elementwise bandwidth). When the per-key slab is
+// word-aligned (bytes_per_key % 4 == 0 — every float32/int32 output) and
+// the keys are row-contiguous, write the two 32-bit hash words directly:
+// two coalesced word stores per thread.
+__global__ void rbitsc_word(
+    const uint32_t* keys,
+    uint32_t* out,
+    dim3 grid_dims,
+    bool odd,
+    uint64_t words_per_key) {
+  auto grid = cg::this_grid();
+  uint32_t thread_index = grid.thread_rank();
+  uint32_t index_x = thread_index % grid_dims.x;
+  uint32_t index_y = thread_index / grid_dims.x;
+  if (index_x >= grid_dims.x || index_y >= grid_dims.y) {
+    return;
+  }
+
+  auto kidx = 2 * index_x;
+  auto key = uint2{keys[kidx], keys[kidx + 1]};
+  auto half_size = grid_dims.y - odd;
+  out += size_t(index_x) * words_per_key;
+  bool drop_last = odd && (index_y == half_size);
+  auto bits = threefry2x32_hash(
+      key, uint2{index_y, drop_last ? 0 : index_y + grid_dims.y});
+  out[index_y] = bits.val.x;
+  if (!drop_last) {
+    out[size_t(index_y) + grid_dims.y] = bits.val.y;
+  }
+}
+
 __global__ void rbitsc(
     const uint32_t* keys,
     uint8_t* out,
@@ -171,7 +205,18 @@ void RandomBits::eval_gpu(const std::vector<array>& inputs, array& out) {
       static_cast<uint32_t>(num_keys), static_cast<uint32_t>(half_size + odd)};
   auto [grid, block] = get_grid_and_block(threads_x, threads_y, 1);
   auto& stream = encoder.stream();
-  if (keys.flags().row_contiguous) {
+  if (keys.flags().row_contiguous && bytes_per_key % 4 == 0) {
+    // Word-aligned slabs: coalesced 32-bit stores (genmlx-nznb).
+    encoder.add_kernel_node(
+        cu::rbitsc_word,
+        grid,
+        block,
+        gpu_ptr<uint32_t>(keys),
+        reinterpret_cast<uint32_t*>(gpu_ptr<uint8_t>(out)),
+        grid_dims,
+        odd,
+        bytes_per_key / 4);
+  } else if (keys.flags().row_contiguous) {
     encoder.add_kernel_node(
         cu::rbitsc,
         grid,
