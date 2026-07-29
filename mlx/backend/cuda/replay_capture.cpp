@@ -203,7 +203,12 @@ std::optional<array> replay_capture_clone_array(
     void* handle,
     const array& src) {
   auto* sink = static_cast<cu::ReplaySink*>(handle);
-  if (src.offset() != 0) {
+  // Row-contiguous offset views are staged device-side too (genmlx-qkx6):
+  // gpu_ptr adds the offset, and a row-contiguous view's data_size span
+  // starting there is exactly its logical contents. Declining them sent
+  // slice-backed captured-call inputs to the full eager path (~187 ms per
+  // 4000-op chunk on the chunked-HMC shapes).
+  if (src.offset() != 0 && !src.flags().row_contiguous) {
     return std::nullopt;
   }
   cu::sink_device().make_current();
@@ -246,8 +251,11 @@ std::optional<array> replay_capture_clone_array(
 
 bool replay_capture_copy_into(void* handle, const array& dst, const array& src) {
   auto* sink = static_cast<cu::ReplaySink*>(handle);
-  if (src.offset() != 0 || dst.offset() != 0 ||
-      src.data_size() != dst.data_size() || src.dtype() != dst.dtype()) {
+  // src may be a row-contiguous offset view (genmlx-qkx6) — see the note in
+  // clone_array. dst is always a sink-owned offset-0 staging clone.
+  if ((src.offset() != 0 && !src.flags().row_contiguous) ||
+      dst.offset() != 0 || src.data_size() != dst.data_size() ||
+      src.dtype() != dst.dtype()) {
     return false;
   }
   cu::sink_device().make_current();
