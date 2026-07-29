@@ -933,21 +933,12 @@ void compile_fuse(
 
     std::vector<array> old_outputs;
     // Add to global cache and add any global outputs to outputs
-    // of new primitive
+    // of new primitive. (Old outputs' parents are pruned of fused entries
+    // at merge time below, once per old output.)
     for (int j = 0; j < fused_tape.size() - 1; ++j) {
       auto& f = fused_tape[j];
       if (output_map.find(f.id()) != output_map.end()) {
         old_outputs.push_back(f);
-        // Parents are now siblings, update the parent map
-        auto& pairs = parents_map[f.id()];
-        pairs.erase(
-            std::remove_if(
-                pairs.begin(),
-                pairs.end(),
-                [&](auto& p) {
-                  return cache.find(p.first.id()) != cache.end();
-                }),
-            pairs.end());
       } else {
         // Remove inner fused arrays parents from the parents map
         // to keep the parents map in a valid state
@@ -956,6 +947,9 @@ void compile_fuse(
       global_cache.insert({f.id()});
     }
     old_outputs.push_back(arr);
+    // The root is fused away too: record it so stale parent entries that
+    // still reference it are recognizably dead (see the pruning note below).
+    global_cache.insert(arr.id());
 
     std::vector<Shape> shapes;
     std::vector<Dtype> types;
@@ -989,23 +983,42 @@ void compile_fuse(
     // One output per primitive
     new_tape.push_back(compiled_outputs.back());
 
-    // Replace inputs old parents with compiled_outputs
+    // Add compiled_outputs as parents of the inputs. The just-fused parents
+    // are deliberately NOT erased from `pairs` here: pruning would rescan
+    // the input's full parents vector once per fusion, which is
+    // O(tape² / depth) when an input is shared across the whole tape (a
+    // step-size scalar or a pre-generated noise tensor in a long unrolled
+    // chain — measured 207 s of compile time for an 8k-op chain, scaling
+    // quadratically). Stale entries referencing fused-away parents are
+    // instead pruned lazily, exactly where they could be observed:
+    // - `cache` membership tests (all_parents_in, split_one's divider) are
+    //   false for a fused-away id either way — the recursion can never
+    //   reach a fused-away node (no live consumers), so it is never cached.
+    // - merge_one rewrites parents' inputs, so old_outputs' pairs are
+    //   pruned against global_cache right before merging (below). Each
+    //   node is an old output of at most one fusion, so that prune is
+    //   amortized linear over the tape.
     for (int i = 0; i < inputs.size(); ++i) {
       auto& pairs = parents_map[inputs[i].id()];
-      pairs.erase(
-          std::remove_if(
-              pairs.begin(),
-              pairs.end(),
-              [&](auto& p) { return cache.find(p.first.id()) != cache.end(); }),
-          pairs.end());
       for (auto& o : compiled_outputs) {
         pairs.push_back({o, i});
       }
     }
 
-    // - Update outputs parents to point to compiled outputs
+    // - Update outputs parents to point to compiled outputs (pruning dead
+    //   fused entries first — merge_one rewrites parent inputs, and a
+    //   stale entry would corrupt an earlier fusion's inner tape)
     // - Update any overall graph outputs to be compiled outputs
     for (int o = 0; o < old_outputs.size(); ++o) {
+      auto& pairs = parents_map[old_outputs[o].id()];
+      pairs.erase(
+          std::remove_if(
+              pairs.begin(),
+              pairs.end(),
+              [&](auto& p) {
+                return global_cache.find(p.first.id()) != global_cache.end();
+              }),
+          pairs.end());
       merge_one(compiled_outputs[o], old_outputs[o], parents_map);
       if (auto it = output_map.find(old_outputs[o].id());
           it != output_map.end()) {
