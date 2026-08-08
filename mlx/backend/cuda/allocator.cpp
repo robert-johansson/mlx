@@ -12,9 +12,11 @@
 #include <fmt/format.h>
 #include <pthread.h> // genmlx-kfli instrumentation
 
+#include <algorithm>
 #include <cassert>
 #include <fstream>
 #include <string>
+#include <vector>
 
 namespace mlx::core {
 
@@ -197,6 +199,24 @@ CudaAllocator::malloc_async(size_t size, int device, cudaStream_t stream) {
     // If we have a lot of memory pressure try to reclaim memory from the cache.
     int64_t mem_to_free =
         get_active_memory() + get_cache_memory() + size - memory_limit_;
+    // Internal accounting is blind to other processes on the card and to
+    // pool fragmentation. For non-trivial device allocations also consult
+    // the driver's real free figure and release enough cache to cover the
+    // request plus a margin (genmlx-q25w: varying-shape RL training OOMed
+    // ~step 20 while our own cache held ~90 GB).
+    if (device >= 0 && size >= (1 << 20) && get_cache_memory() > 0) {
+      cu::device(device).make_current();
+      size_t real_free = 0, real_total = 0;
+      if (cudaMemGetInfo(&real_free, &real_total) == cudaSuccess) {
+        constexpr size_t margin = size_t(1) << 29; // 512 MB
+        if (real_free < size + margin) {
+          mem_to_free = std::max<int64_t>(
+              mem_to_free, int64_t(size + margin - real_free));
+        }
+      } else {
+        (void)cudaGetLastError();
+      }
+    }
     if (mem_to_free > 0) {
       buffer_cache_.release_cached_buffers(mem_to_free);
     }
@@ -213,7 +233,20 @@ CudaAllocator::malloc_async(size_t size, int device, cudaStream_t stream) {
       } else {
         cu::device(device).make_current();
         if (mem_pools_[device]) { // supports memory pools
-          CHECK_CUDA_ERROR(cudaMallocAsync(&data, size, stream));
+          cudaError_t err = cudaMallocAsync(&data, size, stream);
+          if (err != cudaSuccess) {
+            (void)cudaGetLastError();
+            data = rescue_device_alloc(size, device, stream, &device);
+            if (data == nullptr) {
+              std::ostringstream msg;
+              msg << "[malloc] Unable to allocate " << size
+                  << " bytes on device " << device
+                  << " (cache evicted, pool trimmed, unified fallback "
+                     "failed): "
+                  << cudaGetErrorString(err);
+              throw std::runtime_error(msg.str());
+            }
+          }
         } else {
           if (thread_capture_depth() > 0) { // genmlx-kfli instrumentation
             fprintf(
@@ -363,10 +396,20 @@ void CudaAllocator::free_async(CudaBuffer& buf, cudaStream_t stream) {
   } else {
     // Free asynchronously when memory pools is supported.
     if (mem_pools_[buf.device]) {
-      if (!stream) {
-        stream = free_streams_[buf.device];
+      if (stream) {
+        // Caller knows the ordering stream (migration path): the free is
+        // stream-ordered after the producer, safe to enqueue directly.
+        CHECK_CUDA_ERROR(cudaFreeAsync(buf.data, stream));
+      } else {
+        // No ordering stream is known. cudaFreeAsync on the idle
+        // free stream would complete immediately, letting the pool
+        // reclaim (or unmap at the next trim) memory an
+        // enqueued-but-unexecuted kernel still references — inputs are
+        // protected by encoder temporaries, but an output dropped by the
+        // host before its producer executes is not (genmlx-q25w). Defer
+        // to the next compute-stream drain point instead.
+        defer_device_free(buf.data, buf.size, buf.device);
       }
-      CHECK_CUDA_ERROR(cudaFreeAsync(buf.data, stream));
     } else {
       if (thread_capture_depth() > 0) { // genmlx-kfli instrumentation
       fprintf(
@@ -378,6 +421,109 @@ void CudaAllocator::free_async(CudaBuffer& buf, cudaStream_t stream) {
     CHECK_CUDA_ERROR(cudaFree(buf.data));
     }
   }
+}
+
+void CudaAllocator::defer_device_free(void* data, size_t size, int device) {
+  std::lock_guard lk(deferred_mutex_);
+  deferred_frees_.push_back({data, size, device});
+  deferred_bytes_ += size;
+}
+
+void CudaAllocator::drain_deferred_frees(int device, cudaStream_t stream) {
+  {
+    std::lock_guard lk(deferred_mutex_);
+    if (deferred_frees_.empty()) {
+      return;
+    }
+  }
+  // Never enqueue frees onto a capturing stream: the free would become a
+  // graph node and replay (replay-sink windows keep the compute stream
+  // capturing across commits — genmlx-7prh).
+  cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+  if (cudaStreamIsCapturing(stream, &status) != cudaSuccess) {
+    (void)cudaGetLastError();
+    return;
+  }
+  if (status != cudaStreamCaptureStatusNone) {
+    return;
+  }
+  std::vector<DeferredFree> to_free;
+  {
+    std::lock_guard lk(deferred_mutex_);
+    auto it = std::partition(
+        deferred_frees_.begin(),
+        deferred_frees_.end(),
+        [device](const DeferredFree& f) { return f.device != device; });
+    to_free.assign(it, deferred_frees_.end());
+    deferred_frees_.erase(it, deferred_frees_.end());
+    for (const auto& f : to_free) {
+      deferred_bytes_ -= f.size;
+    }
+  }
+  for (const auto& f : to_free) {
+    CHECK_CUDA_ERROR(cudaFreeAsync(f.data, stream));
+  }
+}
+
+void* CudaAllocator::rescue_device_alloc(
+    size_t size,
+    int device,
+    cudaStream_t stream,
+    int* out_device) {
+  *out_device = device;
+  // Stage 1: give back everything we hoard — the entire buffer cache.
+  {
+    std::lock_guard lk(mutex_);
+    buffer_cache_.clear();
+  }
+  void* data = nullptr;
+  if (cudaMallocAsync(&data, size, stream) == cudaSuccess) {
+    return data;
+  }
+  (void)cudaGetLastError();
+  // Stage 2: outside capture, let the stream catch up so stream-ordered
+  // frees from earlier commits actually reach the pool, then trim the
+  // pool so fragmented reservations return to the driver and can be
+  // re-carved for this request. Deferred frees are deliberately NOT
+  // drained here: mid-eval, an entry's producer kernel may still sit in
+  // the current un-launched batch graph — only the post-launch drain in
+  // CommandEncoder::commit() can order the free after it.
+  bool capturing = (thread_capture_depth() > 0);
+  if (!capturing) {
+    if (stream != nullptr &&
+        cudaStreamSynchronize(stream) != cudaSuccess) {
+      (void)cudaGetLastError();
+    }
+    if (cudaMemPoolTrimTo(mem_pools_[device], 0) != cudaSuccess) {
+      (void)cudaGetLastError();
+    }
+    if (cudaMallocAsync(&data, size, stream) == cudaSuccess) {
+      return data;
+    }
+    (void)cudaGetLastError();
+  }
+  // Stage 3: unified-memory fallback — slower, but the step survives.
+  // Mirrors move_to_unified_memory's residency change on demand.
+  data = nullptr;
+  cudaError_t err = supports_managed_memory()
+      ? cudaMallocManaged(&data, size)
+      : cudaMallocHost(&data, size);
+  if (err == cudaSuccess && data != nullptr) {
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      fprintf(
+          stderr,
+          "[mlx] CUDA device pool exhausted; falling back to unified memory "
+          "for a %zu-byte allocation (training continues, slower). Consider "
+          "MLX_CACHE_LIMIT_GB to bound the freelist.\n",
+          size);
+    }
+    *out_device = -1;
+    return data;
+  }
+  (void)cudaGetLastError();
+  return nullptr;
 }
 
 size_t CudaAllocator::get_active_memory() const {
@@ -414,8 +560,43 @@ size_t CudaAllocator::set_cache_limit(size_t limit) {
 }
 
 void CudaAllocator::clear_cache() {
-  std::lock_guard lk(mutex_);
-  buffer_cache_.clear();
+  {
+    std::lock_guard lk(mutex_);
+    buffer_cache_.clear();
+  }
+  // The clear above deferred every device-pool buffer. clear_cache is a
+  // host-side quiescent point (idle sweeper, synchronize_and_clear_cache),
+  // so if the device can be synchronized — which fails cleanly when any
+  // capture is open — every launched writer has executed and the deferred
+  // entries can be handed back to the pool directly, then the pools
+  // trimmed so the memory actually leaves the process. If the sync fails
+  // the entries simply wait for the next commit drain.
+  if (cudaDeviceSynchronize() != cudaSuccess) {
+    (void)cudaGetLastError();
+    return;
+  }
+  std::vector<DeferredFree> to_free;
+  {
+    std::lock_guard lk(deferred_mutex_);
+    to_free = std::move(deferred_frees_);
+    deferred_frees_.clear();
+    deferred_bytes_ = 0;
+  }
+  for (const auto& f : to_free) {
+    if (cudaFreeAsync(f.data, free_streams_[f.device]) != cudaSuccess) {
+      (void)cudaGetLastError();
+    }
+  }
+  for (size_t i = 0; i < mem_pools_.size(); ++i) {
+    if (mem_pools_[i]) {
+      if (cudaStreamSynchronize(free_streams_[i]) != cudaSuccess) {
+        (void)cudaGetLastError();
+      }
+      if (cudaMemPoolTrimTo(mem_pools_[i], 0) != cudaSuccess) {
+        (void)cudaGetLastError();
+      }
+    }
+  }
 }
 
 CudaAllocator& allocator() {

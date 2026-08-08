@@ -67,9 +67,38 @@ class CudaAllocator : public allocator::Allocator {
   size_t set_cache_limit(size_t limit);
   void clear_cache();
 
+  // Enqueue every pending device-pool free for |device| onto |stream|
+  // (stream-ordered after all work already enqueued there). Called by
+  // CommandEncoder::commit()/synchronize() on the compute stream — the
+  // only point where "after everything enqueued so far" is the same thing
+  // as "after every kernel that may still read the buffer". No-op while
+  // |stream| is capturing (a captured free node would be replayed).
+  void drain_deferred_frees(int device, cudaStream_t stream);
+
  private:
   void free_cuda_buffer(CudaBuffer* buf);
   void free_async(CudaBuffer& buf, cudaStream_t stream = nullptr);
+  // A device-pool free with no known ordering stream. Deferred until a
+  // compute-stream drain point instead of cudaFreeAsync on the idle
+  // free stream: an unordered free lets the pool reclaim (or unmap at
+  // the next trim) memory that an enqueued-but-unexecuted kernel still
+  // references — the use-after-free class behind the capped-cache
+  // illegal-access crashes (genmlx-q25w).
+  void defer_device_free(void* data, size_t size, int device);
+  // Emergency ladder when a device allocation fails: evict the buffer
+  // cache, synchronize + trim the pool (when legal), retry, and fall
+  // back to unified memory before giving up. Returns nullptr only when
+  // every stage failed; writes the actual residency (device index, or
+  // -1 when the unified fallback was taken) to |out_device|. Called
+  // WITHOUT mutex_ held.
+  void*
+  rescue_device_alloc(size_t size, int device, cudaStream_t stream, int* out_device);
+
+  struct DeferredFree {
+    void* data;
+    size_t size;
+    int device;
+  };
 
   CudaAllocator();
   friend CudaAllocator& allocator();
@@ -85,6 +114,12 @@ class CudaAllocator : public allocator::Allocator {
   std::vector<CudaStream> free_streams_;
   std::vector<cudaMemPool_t> mem_pools_;
   SmallSizePool scalar_pool_;
+  // Guarded by its own mutex: free_async is reached both with and
+  // without mutex_ held (free_cuda_buffer vs move_to_unified_memory),
+  // and drain runs from encoder threads.
+  std::mutex deferred_mutex_;
+  std::vector<DeferredFree> deferred_frees_;
+  size_t deferred_bytes_{0};
 };
 
 CudaAllocator& allocator();
