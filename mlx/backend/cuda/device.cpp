@@ -1,5 +1,6 @@
 // Copyright © 2025 Apple Inc.
 
+#include "mlx/backend/cuda/allocator.h"
 #include "mlx/backend/cuda/device.h"
 #include "mlx/backend/cuda/worker.h"
 #include "mlx/backend/gpu/device_info.h"
@@ -750,6 +751,13 @@ void CommandEncoder::commit() {
     // Reset state
     reset_graph_state();
   }
+
+  // Every kernel of this batch is now enqueued on stream_ (graph launch
+  // or eager). Deferred device-pool frees are safe to order after them —
+  // this is the sole point where "after everything enqueued" covers any
+  // producer whose output the host dropped before execution (genmlx-q25w).
+  // drain_deferred_frees itself skips capturing streams (replay sink).
+  allocator().drain_deferred_frees(device_.cuda_device(), stream_);
 
   // Put completion handlers in a batch.
   worker_->commit(stream_);
