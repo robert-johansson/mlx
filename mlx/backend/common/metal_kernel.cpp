@@ -362,6 +362,9 @@ CustomKernelFunction metal_kernel(
                 << "```" << std::endl;
     }
 
+    // Keep the declared output shapes on the primitive so
+    // `Primitive::output_shapes` can serve shapeless compile replay.
+    auto declared_output_shapes = output_shapes;
     return array::make_arrays(
         std::move(output_shapes),
         std::move(output_dtypes),
@@ -377,7 +380,8 @@ CustomKernelFunction metal_kernel(
             std::vector<ScalarArg>{},
             false,
             0,
-            compile_options.serialize()),
+            compile_options.serialize(),
+            std::move(declared_output_shapes)),
         std::move(inputs));
   };
 }
